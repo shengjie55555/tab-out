@@ -97,6 +97,78 @@
   </div><!-- end .dashboard-columns -->
 
   <!-- ================================================================
+       COLLECTED TABS — a library of links you organise yourself, nested as
+       deep as you like.
+       The toolbar below is STATIC markup: app.js rewrites only the tree and
+       the select's <option> list, never these fields — so a live-sync
+       re-render can't destroy a field you're typing into mid-word.
+       ================================================================ -->
+  <section class="collections-section" id="collectionsSection">
+    <div class="section-header">
+      <h2>Collected tabs</h2>
+      <div class="section-line"></div>
+      <div class="section-count" id="collectionsCount"></div>
+    </div>
+
+    <!-- Two rows, not nine controls in one: the top row is what you're adding,
+         the bottom row is where it goes and how you're looking at the tree. -->
+    <div class="collection-bar">
+      <div class="collection-bar-row">
+        <select class="collection-ctl collection-kind" id="collectKindSelect" aria-label="What to add">
+          <option value="link">Link</option>
+          <option value="note">Note</option>
+          <option value="snippet">Code</option>
+        </select>
+
+        <!-- A textarea, not an input: notes and snippets are multi-line, and so
+             is a whole list pasted in at once -->
+        <textarea class="collection-ctl collection-value" id="collectUrlInput" rows="1"
+                  placeholder="Paste a link, or a path…" aria-label="Link, path, note or code" spellcheck="false"></textarea>
+
+        <input type="text" class="collection-ctl collection-name-input" id="collectNameInput"
+               placeholder="Name (optional)" aria-label="Name" spellcheck="false">
+
+        <input type="text" class="collection-ctl collection-language" id="collectLanguageInput"
+               placeholder="lang" aria-label="Language" spellcheck="false" style="display:none">
+
+        <button class="action-btn" data-action="add-collection-link">Add</button>
+      </div>
+
+      <div class="collection-bar-row is-meta">
+        <!-- Labelled as a destination, not as part of the value above it, and
+             it's where the folder button on any tab drops things too -->
+        <label class="collection-target-label" for="collectTargetSelect">Add to</label>
+        <select class="collection-ctl collection-target" id="collectTargetSelect" aria-label="Add to"></select>
+
+        <!-- Creates inside whatever "Add to" points at, so pointing that at a
+             group first is how you make a subgroup -->
+        <button class="action-btn" data-action="add-collection-group"
+                title="Create a group inside the current destination">New group</button>
+
+        <span class="collection-bar-spacer"></span>
+
+        <!-- Filtering. Static markup like the rest of the bar, so it stays
+             typable through a live-sync re-render of the tree below it. -->
+        <input type="search" class="collection-ctl collection-filter" id="collectionFilterInput"
+               placeholder="Filter…" aria-label="Filter the collection" spellcheck="false">
+        <select class="collection-ctl collection-kind" id="collectionStatusFilter" aria-label="Filter by status">
+          <option value="">Any status</option>
+          <option value="todo">To do</option>
+          <option value="doing">Doing</option>
+          <option value="done">Done</option>
+          <option value="dropped">Dropped</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="collection-tree" id="collectedTree" role="tree" aria-label="Collected tabs"></div>
+
+    <div class="collection-empty" id="collectionsEmpty" style="display:none">
+      Nothing collected yet. Paste a link above, or hit the bookmark icon on any tab.
+    </div>
+  </section>
+
+  <!-- ================================================================
        FOOTER — global stats + refresh control
        ================================================================ -->
   <footer>

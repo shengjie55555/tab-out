@@ -7,6 +7,9 @@
   --paper: #f8f5f0;
   --warm-gray: #e8e2da;
   --muted: #9a918a;
+  /* A darker muted for small interactive glyphs: --muted is only 2.84:1 on
+     paper, under the 3:1 floor for UI components. This one is 5.3:1. */
+  --ink-soft: #6b6560;
   --accent-amber: #c8713a;
   --accent-sage: #5a7a62;
   --accent-slate: #5a6b7a;
@@ -509,6 +512,10 @@ header {
 .chip-action:hover {
   opacity: 1;
   background: rgba(154, 145, 138, 0.1);
+}
+
+.chip-collect:hover {
+  color: var(--accent-sage);
 }
 
 .chip-save:hover {
@@ -1211,3 +1218,509 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   opacity: 0.6;
   flex-shrink: 0;
 }
+
+
+/* ================================================================
+   COLLECTED TABS — the nestable link library
+
+   A group IS a .mission-card — the same class an Open tabs group uses — so
+   the card language (accent bar, header, badge, chips) is shared rather than
+   reimplemented, and the two sections can't drift apart. Depth only ever
+   subtracts from it: the shadow goes first, then the top bar gives way to a
+   side accent.
+   ================================================================ */
+
+.collections-section {
+  margin-top: 52px;
+}
+
+/* ---- the control bar (all static markup; app.js rewrites only the tree and
+   the target select's options, so nothing here is disturbed by a render) ---- */
+
+.collection-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  margin-bottom: 20px;
+  border: 1px solid var(--warm-gray);
+  border-radius: 10px;
+  background: var(--card-bg);
+}
+
+.collection-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.collection-bar-spacer {
+  flex: 1;
+}
+
+/* One control style for every field in the bar, so they line up */
+.collection-ctl {
+  font: inherit;
+  font-size: 13px;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--warm-gray);
+  border-radius: 6px;
+  background: var(--paper);
+  color: var(--ink);
+  min-width: 0;
+}
+
+.collection-ctl::placeholder {
+  color: var(--muted);
+}
+
+.collection-ctl:focus {
+  outline: none;
+  border-color: var(--accent-slate);
+  box-shadow: 0 0 0 2px rgba(90, 107, 122, 0.15);
+}
+
+.collection-kind {
+  flex: 0 0 auto;
+  cursor: pointer;
+}
+
+/* The value field takes links, paths, notes and pasted code, so it grows */
+.collection-value {
+  flex: 1 1 260px;
+  height: auto;
+  min-height: 32px;
+  max-height: 180px;
+  padding: 7px 10px;
+  line-height: 1.4;
+  resize: vertical;
+  font-family: inherit;
+}
+
+.collection-name-input {
+  flex: 0 1 170px;
+}
+
+.collection-language {
+  flex: 0 0 64px;
+}
+
+.collection-target {
+  flex: 0 1 220px;
+  cursor: pointer;
+}
+
+.collection-filter {
+  flex: 0 1 150px;
+}
+
+.collection-target-label {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+}
+
+/* ---- the tree of cards ---- */
+.collection-tree {
+  margin-bottom: 8px;
+}
+
+/* The board: a grid whose column count app.js computes (it has to clamp each
+   card's stored span to the columns that actually exist). Default one column
+   per card, which is about the width of an Open tabs card.
+ *
+ * Rows are a fine unit rather than 1fr, and each card's row span is measured
+ * from its content by app.js. That's what gives tight packing: a 1fr row would
+ * make every row as tall as the tallest card in it, leaving a hole under each
+ * short one — the one thing a multi-column layout does better than a plain
+ * grid, and the reason this isn't just `gap: 12px`. */
+.collection-board {
+  display: grid;
+  grid-template-columns: repeat(var(--collection-columns, 4), minmax(0, 1fr));
+  grid-auto-rows: 8px;
+  column-gap: 12px;
+  row-gap: 0;
+  align-items: start;          /* cards size to content, not to the row */
+}
+
+/* EVERY direct child is a tile — a group card, or a leaf sitting loose at the
+   top level. Both need the grid placement and a row span; without that a bare
+   .page-chip lands in an 8px row and overlaps whatever is beside it. */
+.collection-board > * {
+  grid-column: span var(--card-span, 1);
+  grid-row: span var(--row-span, 24);
+  /* The vertical gap is the tile's own margin, not a row gap, so the measured
+     row span can include it and the packing stays exact. */
+  margin-bottom: 12px;
+}
+
+/* A loose leaf is a .page-chip, which is built to sit inside a card as one row
+   of a list. On the board it needs a tile's shell, or it reads as a stray. */
+.collection-board > .page-chip {
+  align-items: flex-start;
+  padding: 10px 12px;
+  border: 1px solid var(--warm-gray);
+  border-radius: 8px;
+  background: var(--card-bg);
+}
+
+.collection-board > .collection-card[draggable="true"] {
+  cursor: grab;
+}
+
+/* Where a dragged card will land */
+.collection-card.is-drop-before,
+.collection-card.is-drop-after {
+  outline: 2px solid var(--accent-slate);
+  outline-offset: -1px;
+}
+
+.collection-card.is-drop-before::after,
+.collection-card.is-drop-after::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--accent-slate);
+}
+
+/* Inside the card: .mission-card clips its overflow, so a bar at -8px would
+   simply not be drawn */
+.collection-card.is-drop-before::after { left: 2px; }
+.collection-card.is-drop-after::after  { right: 2px; }
+
+/* ---- the resize edge ----
+   A faint grip is always drawn so the edge is discoverable; the full strip
+   only lights up on hover, where it's the obvious thing to grab. */
+.collection-resize {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 9px;
+  cursor: col-resize;
+  opacity: 0;
+  background: linear-gradient(to right, transparent, rgba(26, 22, 19, 0.05));
+  transition: opacity 0.15s;
+}
+
+.collection-resize::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  right: 3px;
+  width: 2px;
+  height: 18px;
+  margin-top: -9px;
+  border-radius: 1px;
+  background: var(--warm-gray);
+  transition: background 0.15s;
+}
+
+.collection-board > .collection-card:hover > .collection-resize {
+  opacity: 1;
+}
+
+.collection-resize:hover::after {
+  background: var(--accent-slate);
+}
+
+/* Nesting is real containment, so this is the only indent rule there is —
+   cards never get indented by hand. The rule marks the level and doubles as
+   the expand/collapse affordance's guide. */
+.collection-children {
+  margin-top: 10px;
+  padding-left: 14px;
+  border-left: 1px solid var(--warm-gray);
+}
+
+/* Cards inside cards don't need the page grid's breathing room */
+.collection-children .mission-card {
+  margin-bottom: 8px;
+}
+
+.collection-children .mission-card:last-child {
+  margin-bottom: 0;
+}
+
+/* ---- depth: each level subtracts a little ----
+     is-depth-0  full card with its coloured top bar (from .mission-card)
+     is-depth-1  shadow off, top bar quietened
+     is-deep     shadow off, no top bar — a side accent carries the colour
+*/
+.collection-card.is-depth-1 {
+  box-shadow: none;
+}
+
+.collection-card.is-depth-1::before {
+  background: var(--warm-gray);
+}
+
+.collection-card.is-depth-1:hover,
+.collection-card.is-deep:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+.collection-card.is-deep {
+  box-shadow: none;
+  background: transparent;
+  border-radius: 0;
+}
+
+.collection-card.is-deep::before {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: auto;
+  width: 3px;
+  height: auto;
+  border-radius: 2px;
+  background: var(--card-accent, var(--warm-gray));
+}
+
+/* Pin the row actions to the right of the card header, like the tab badge is
+   in an Open tabs card */
+.collection-card .collection-row-actions {
+  margin-left: auto;
+}
+
+.collection-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  flex-shrink: 0;
+}
+
+.collection-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--ink-soft);
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+}
+
+.collection-action svg {
+  width: 13px;
+  height: 13px;
+}
+
+.collection-action:hover {
+  color: var(--ink);
+  background: rgba(26, 22, 19, 0.06);
+}
+
+.collection-action.is-danger:hover {
+  color: var(--accent-rose);
+  background: rgba(179, 90, 90, 0.1);
+}
+
+/* ---- chips ----
+   A link is a .page-chip, so its action buttons already inherit the dimmed
+   .chip-action treatment the tab chips use — visible always, brighter on
+   hover. Nothing hover-only to discover. */
+.chip-delete:hover {
+  color: var(--accent-rose);
+}
+
+/* Armed for deletion: deleting a group takes its whole subtree with it, so
+   the card says so before the second click lands. */
+.collection-card.is-confirming,
+.page-chip.is-confirming {
+  box-shadow: 0 0 0 1px rgba(179, 90, 90, 0.4);
+}
+
+.collection-card.is-confirming .collection-action.is-danger,
+.page-chip.is-confirming .chip-delete {
+  color: var(--accent-rose);
+  opacity: 1;
+}
+
+/* An entry whose URL has no scheme. Deliberately not clickable — see
+   safeCollectionHref() in app.js for why it must not become a link. */
+.page-chip.is-unlinked {
+  cursor: default;
+}
+
+.page-chip.is-unlinked .chip-text {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.collection-favicon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  border-radius: 2px;
+}
+
+/* The inline rename field — metrics close to .mission-name / .chip-text so
+   swapping one for the other doesn't shift the row */
+.collection-rename {
+  font: inherit;
+  font-size: 13px;
+  padding: 2px 6px;
+  border: 1px solid var(--accent-slate);
+  border-radius: 4px;
+  background: var(--card-bg);
+  color: var(--ink);
+  flex: 1;
+  min-width: 0;
+}
+
+.collection-rename:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(90, 107, 122, 0.15);
+}
+
+/* The "move to" select borrows the rename field's slot and metrics */
+.collection-move {
+  max-width: 320px;
+  cursor: pointer;
+}
+
+.collection-empty {
+  font-size: 13px;
+  color: var(--muted);
+  padding: 4px 0 8px;
+}
+
+
+/* ================================================================
+   COLLECTED TABS — the three kinds of leaf
+
+   A link opens or copies, a note is prose, a snippet is code. All three share
+   the .page-chip shell; only the icon, the body and the row's cursor differ.
+   ================================================================ */
+
+.collection-item-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chip-icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-soft);
+}
+
+.chip-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* A path or an id. Not a link — clicking copies it — so the cursor says so. */
+.page-chip.is-copyable {
+  cursor: copy;
+}
+
+.collection-note {
+  font-size: 12px;
+  color: var(--ink-soft);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.collection-snippet {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.collection-lang {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+}
+
+.collection-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--ink);
+  background: rgba(26, 22, 19, 0.04);
+  border-radius: 4px;
+  padding: 4px 6px;
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* The status dot: always visible, one click per state, no popover */
+.collection-status {
+  width: 10px;
+  height: 10px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--warm-gray);
+  background: transparent;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.collection-status:hover {
+  border-color: var(--ink-soft);
+}
+
+.collection-status.is-todo    { background: var(--accent-slate); border-color: var(--accent-slate); }
+.collection-status.is-doing   { background: var(--accent-amber); border-color: var(--accent-amber); }
+.collection-status.is-done    { background: var(--accent-sage);  border-color: var(--accent-sage); }
+.collection-status.is-dropped { background: var(--muted);        border-color: var(--muted); opacity: 0.45; }
+
+/* "Collect this whole group" — pushed to the far end of the action row, away
+   from the destructive buttons it sits beside */
+/* Armed for a second click: a batch close asks before it takes several tabs
+   with it. Closing a single tab is deliberately not gated this way. */
+.action-btn.is-confirming {
+  color: var(--accent-rose);
+  border-color: rgba(179, 90, 90, 0.5);
+  background: rgba(179, 90, 90, 0.08);
+}
+
+.tab-cleanup-btn.is-confirming {
+  background: var(--accent-rose);
+}
+
+.action-btn.collect-group {
+  margin-left: auto;
+}
+
+.action-btn.collect-group:hover {
+  color: var(--accent-sage);
+  border-color: rgba(90, 122, 98, 0.4);
+  background: rgba(90, 122, 98, 0.07);
+}
+
+.action-btn.collect-group svg {
+  width: 13px;
+  height: 13px;
+}
+

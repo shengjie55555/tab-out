@@ -16,6 +16,7 @@ Before doing anything technical, tell the user what they're about to get:
 > - **Collapse from here** — collapse a card and the group collapses in Chrome too
 > - **Stays current** — tabs you open, close or regroup show up right away; there's nothing to refresh
 > - **Close tabs with style** satisfying swoosh sound + confetti burst
+> - **A collected-tabs library** — a nestable tree of links, notes and code you build yourself, with drag-to-arrange cards
 > - **Duplicate detection** flags when you have the same page open twice
 > - **Click any tab title to jump to it** even across different Chrome windows
 > - **Save for later** bookmark individual tabs to a checklist before closing them
@@ -82,11 +83,20 @@ Once the extension is loaded:
 > 2. **Each card wears its group's name and color** — rename or recolor the group in Chrome and the card follows.
 > 3. **Click any tab title** to jump directly to that tab.
 > 4. **Click the X** next to any tab to close just that one (with swoosh + confetti).
-> 5. **Click "Close all N tabs"** on a card to close just that group. Or hit the arrow next to the name to collapse the group — in Chrome as well as here.
-> 6. **Duplicate tabs** are flagged with an amber "(2x)" badge. Click "Close duplicates" to keep one copy.
-> 7. **Save a tab for later** by clicking the bookmark icon before closing it. Saved tabs appear in the sidebar.
+> 5. **Hit the arrow** next to a card's name to collapse that group — in Chrome as well as here.
+> 6. **"Close all N tabs"** closes the whole group, and asks first: closing several tabs at once takes two clicks. Closing a single tab stays one click.
+> 7. **Duplicate tabs** are flagged with an amber "(2x)" badge. Click "Close duplicates" to keep one copy.
+> 8. **Save a tab for later** by clicking the bookmark icon before closing it. Saved tabs appear in the sidebar.
+> 9. **Collect a tab** with the folder icon — or a whole group with "Collect" at the right of its action row. Either way the tabs stay open.
 >
-> That's it! No server to run, no config files. Everything works right away.
+> Then scroll down to **Collected tabs**, the library:
+>
+> 10. **Add anything** from the bar at the top: a link, a note, or a code snippet. Pasting several lines makes one entry per line, all in one new group.
+> 11. **Everything added at the top level gets its own group** — Link1, Note1, Code1 and so on — so the board stays a board of cards.
+> 12. **Drag a card** to reorder it, or drag its right **edge** to make it wider; widths snap to the grid so the columns stay lined up.
+> 13. **Move an entry anywhere** with the arrow icon, filter by text or status on the right, and tag an entry to-do / doing / done / dropped with the dot on its row.
+>
+> That's it! No server to run. Everything works right away.
 
 ---
 
@@ -94,6 +104,7 @@ Once the extension is loaded:
 
 - Tab Out is a pure Chrome extension. No server, no build step, no dependencies to install.
 - `npm test` (plain Node, no install needed) runs the dashboard's grouping and tab-closing tests.
-- Saved tabs are stored in `chrome.storage.local` (persists across sessions).
+- Saved tabs and the collected-tabs library are both stored in `chrome.storage.local` (they persist across sessions). The library lives under the `collections` key.
+- `extension/config.local.js` is optional and gitignored. Its one current use is `LOCAL_LINK_PREFIXES`, which maps your own path prefixes onto a base URL so bare paths become real links. Only http(s) bases are accepted.
 - Your tab data stays local: no server, no accounts, no analytics, and no third-party requests for titles or icons — they come from `chrome.tabs` / `chrome.tabGroups`. (The page does load its fonts from Google Fonts.)
 - To update: `cd tab-out && git pull`, then reload the extension in `chrome://extensions`.

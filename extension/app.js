@@ -34,13 +34,8 @@ let openGroups = [];
 
 // Mirrors chrome.tabGroups.TAB_GROUP_ID_NONE — "this tab isn't in a group".
 // Hardcoded rather than read off chrome.tabGroups so it still works when the
-// API is unavailable (see chromeGroupsAvailable below).
+// API is unavailable.
 const UNGROUPED_ID = -1;
-
-// False once chrome.tabGroups.query() has failed — a missing "tabGroups"
-// permission (extension not reloaded after a manifest edit) or an older
-// Chrome. Everything then falls into the single Ungrouped card.
-let chromeGroupsAvailable = true;
 
 // True when chrome.tabs.query() itself failed. The dashboard can't show
 // anything in that case, so it says so rather than pretending you have
@@ -89,16 +84,14 @@ async function fetchOpenTabs() {
 /**
  * fetchChromeGroups()
  *
- * Reads every tab group in every window. Returns [] (and flips
- * chromeGroupsAvailable to false) if the tabGroups permission is missing.
+ * Reads every tab group in every window. Returns [] if the "tabGroups"
+ * permission isn't in effect, which makes every tab fall into the single
+ * Ungrouped card.
  */
 async function fetchChromeGroups() {
   try {
-    const groups = await chrome.tabGroups.query({});
-    chromeGroupsAvailable = true;
-    return groups;
+    return await chrome.tabGroups.query({});
   } catch (err) {
-    chromeGroupsAvailable = false;
     console.warn(
       '[tab-out] chrome.tabGroups unavailable — every tab will show under ' +
       '"Ungrouped". Reload the extension at chrome://extensions so the ' +
@@ -345,6 +338,975 @@ async function dismissSavedTab(id) {
     tab.dismissed = true;
     await chrome.storage.local.set({ deferred });
   }
+}
+
+
+/* ----------------------------------------------------------------
+   COLLECTED TABS — a curated, nestable library of links
+
+   Deliberately separate from "Saved for later": that one is a transient
+   checklist you tick off, this one is a library you organise and keep. They
+   live under different storage keys and never touch each other.
+
+   Stored under the chrome.storage.local key "collections" as a tree:
+
+     { version: 1, nodes: [
+         { id, type: 'group', name, collapsed, children: [ … ] },
+         { id, type: 'link',  name, url, favIconUrl, addedAt },
+     ]}
+
+   Every function from sanitizeCollectionTree() down to moveCollectionNode()
+   is PURE — it returns a new tree and never mutates its input. That's what
+   makes them unit-testable straight out of the vm sandbox, and it means a
+   caller can't half-apply a change.
+   ---------------------------------------------------------------- */
+
+const COLLECTIONS_KEY     = 'collections';
+const COLLECTIONS_VERSION = 1;
+
+// A tree deeper than this is treated as malformed rather than walked, so a
+// hand-edited storage value can't blow the stack inside the renderer.
+const MAX_COLLECTION_DEPTH = 50;
+
+// How many grid columns a top-level card may span. Widening past this would
+// leave nothing beside it, which defeats the point of a board.
+const MAX_COLLECTION_SPAN = 4;
+
+function normalizeCollectionSpan(value) {
+  const n = Math.trunc(Number(value));
+  if (!Number.isFinite(n)) return 1;
+  return Math.max(1, Math.min(MAX_COLLECTION_SPAN, n));
+}
+
+// A group, or one of the three kinds of leaf:
+//   link    — something with an address; opens, or copies when it has no
+//             address we can follow (a bare path is a link, not a fourth type)
+//   note    — prose, no address at all
+//   snippet — code, copied rather than visited
+const COLLECTION_TYPES = new Set(['group', 'link', 'note', 'snippet']);
+
+// Optional marker on any leaf. '' means none.
+const COLLECTION_STATUSES = new Set(['todo', 'doing', 'done', 'dropped']);
+
+function normalizeCollectionStatus(value) {
+  return COLLECTION_STATUSES.has(value) ? value : '';
+}
+
+/** The stored payload of a leaf, whatever kind it is. */
+function collectionNodeValue(node) {
+  if (!node) return '';
+  if (node.type === 'link')    return node.url  || '';
+  if (node.type === 'note')    return node.text || '';
+  if (node.type === 'snippet') return node.code || '';
+  return '';
+}
+
+/** First line, trimmed and capped — used when an item has no name of its own. */
+function collectionFirstLine(text) {
+  const line = String(text || '').trim().split('\n')[0].trim();
+  return line.length > 80 ? `${line.slice(0, 79)}…` : line;
+}
+
+/**
+ * collectionColumnCount()
+ *
+ * How many columns the board has at the current window width. Computed in JS
+ * rather than left to CSS media queries, because a card's stored span has to
+ * be clamped to the columns actually available — a `span 4` in a 2-column
+ * grid would overflow into an implicit column and break the layout.
+ */
+function collectionColumnCount() {
+  const width = (typeof window !== 'undefined' && window.innerWidth) ? window.innerWidth : 1300;
+  if (width < 700) return 1;
+  if (width < 980) return 2;
+  if (width < 1260) return 3;
+  return 4;
+}
+
+// Serialises read-modify-write cycles — see queueCollectionWrite().
+let collectionsWriteChain = Promise.resolve();
+
+// Which node's name is being edited inline, and what's in the field. Held in
+// module scope rather than read from the DOM, because live sync re-renders the
+// tree out from under you — see the rename state machine in the handlers.
+let editingCollectionNodeId = null;   // string id, or null
+let editingCollectionMode   = 'rename'; // 'rename' (a text field) or 'move' (a select)
+let renameDraft             = '';     // what the field currently shows
+let renameCaret             = null;   // selectionStart as of the last input
+let renameSession           = 0;      // bumped on every open/commit/cancel
+
+// The tree the current render was built from. Only the "move to" select needs
+// it, and threading it through three recursive renderers for that would be
+// worse than reading it here. Held UNFILTERED, so the destinations a node can
+// move to don't change just because a filter is on.
+let collectionTreeForRender = createEmptyCollectionTree();
+
+// What the filter box and the status dropdown currently hold, kept in module
+// scope for the same reason as archiveQuery: a live-sync re-render has to be
+// able to re-apply them.
+let collectionQuery        = '';
+let collectionStatusFilter = '';
+
+// Where new links go — the "Add to" select, and the destination for the
+// bookmark button on any Open tabs chip.
+let collectTargetId = '';
+
+// Drag state. The dragged id lives here rather than in dataTransfer because
+// getData() returns '' during dragover (a browser security rule).
+let collectionDragId     = null;
+let collectionDragActive = false;
+
+// Deleting a group destroys everything under it, so it takes a second click
+// on the same bin. This remembers which row is armed.
+let pendingDeleteId = null;
+
+// Which batch close is armed for a second click. Closing one tab stays a
+// single click — it's the most repeated action in the app, and doubling its
+// clicks would tax the main loop — but a close that takes several tabs with it
+// asks first, the same way deleting from the collected library does.
+let pendingCloseKey = null;
+
+/**
+ * closeNeedsConfirmation(key, message, actionEl)
+ *
+ * → true on the arming click, meaning the caller must stop. Marking the button
+ * directly rather than re-rendering the grid keeps arming cheap; the mark is
+ * transient by design and a later render washes it away.
+ */
+function closeNeedsConfirmation(key, message, actionEl) {
+  if (pendingCloseKey === key) {
+    pendingCloseKey = null;
+    return false;                      // confirmed: carry on
+  }
+
+  pendingCloseKey = key;
+  if (actionEl && actionEl.classList) actionEl.classList.add('is-confirming');
+  showToast(message);
+  return true;
+}
+
+// The grid gap, which the resize maths needs and CSS also uses
+const COLLECTION_BOARD_GAP = 12;
+
+// The board's row height. Small, so a card's row span can follow its content
+// closely; the vertical gap is the card's own margin-bottom, which the span
+// arithmetic includes.
+const COLLECTION_ROW_UNIT = 8;
+
+// Live state for an in-progress edge drag; null when none is happening
+let collectionResize = null;
+
+
+/* ---- reading and repairing ---------------------------------------- */
+
+function createEmptyCollectionTree() {
+  return { version: COLLECTIONS_VERSION, nodes: [] };
+}
+
+/**
+ * sanitizeCollectionTree(raw)
+ *
+ * Returns a tree the renderer can trust. storage.local is user-editable from
+ * devtools, and a malformed node would otherwise crash the recursive renderer
+ * midway through painting. Same defensive posture as normalizeGroupId() and
+ * usableFaviconUrl().
+ *
+ * Drops anything it can't understand rather than guessing: non-objects, unknown
+ * node types, links with no url, and — importantly — nodes whose id duplicates
+ * one already seen, because two nodes sharing an id makes rename and drag act
+ * on the wrong one.
+ */
+function sanitizeCollectionTree(raw) {
+  const tree = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  const seenIds = new Set();
+
+  function cleanNode(node, depth) {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) return null;
+    if (!COLLECTION_TYPES.has(node.type)) return null;
+    if (depth > MAX_COLLECTION_DEPTH) return null;
+
+    const id = (typeof node.id === 'string' || typeof node.id === 'number') ? String(node.id) : '';
+    if (!id || seenIds.has(id)) return null;
+    seenIds.add(id);
+
+    const name   = typeof node.name === 'string' ? node.name : '';
+    const status = normalizeCollectionStatus(node.status);
+    const addedAt = typeof node.addedAt === 'string' ? node.addedAt : '';
+
+    if (node.type === 'link') {
+      if (typeof node.url !== 'string') return null;
+      return {
+        id, type: 'link', name, status,
+        url: node.url,
+        favIconUrl: typeof node.favIconUrl === 'string' ? node.favIconUrl : '',
+        addedAt,
+      };
+    }
+
+    if (node.type === 'note') {
+      return { id, type: 'note', name, status, text: typeof node.text === 'string' ? node.text : '', addedAt };
+    }
+
+    if (node.type === 'snippet') {
+      return {
+        id, type: 'snippet', name, status,
+        code:     typeof node.code     === 'string' ? node.code     : '',
+        language: typeof node.language === 'string' ? node.language : '',
+        addedAt,
+      };
+    }
+
+    return {
+      id, type: 'group', name,
+      collapsed: !!node.collapsed,
+      // Grid columns this card spans. Only top-level cards use it; nested ones
+      // stack inside their parent. Kept on every group so the data round-trips.
+      span: normalizeCollectionSpan(node.span),
+      children: Array.isArray(node.children)
+        ? node.children.map(child => cleanNode(child, depth + 1)).filter(Boolean)
+        : [],
+    };
+  }
+
+  return {
+    version: typeof tree.version === 'number' ? tree.version : COLLECTIONS_VERSION,
+    nodes: Array.isArray(tree.nodes)
+      ? tree.nodes.map(node => cleanNode(node, 0)).filter(Boolean)
+      : [],
+  };
+}
+
+/**
+ * migrateCollectionTree(raw)
+ *
+ * Upgrades an older tree to the current shape. There's only one version so
+ * far, so this is sanitising plus the version bookkeeping the upgrade steps
+ * will hang off later.
+ *
+ * A tree written by a NEWER build is sanitised for display but must never be
+ * written back — see getCollections(), which never persists what it reads. If
+ * it did, this build would quietly strip fields a newer one depends on.
+ */
+function migrateCollectionTree(raw) {
+  const tree = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  const version = typeof tree.version === 'number' ? tree.version : COLLECTIONS_VERSION;
+
+  if (version > COLLECTIONS_VERSION) {
+    console.warn(
+      `[tab-out] Collections are version ${version}, this build understands ` +
+      `${COLLECTIONS_VERSION}. Showing what it can read, and not rewriting it.`
+    );
+  }
+
+  return sanitizeCollectionTree(tree);
+}
+
+async function getCollections() {
+  const stored = await chrome.storage.local.get(COLLECTIONS_KEY);
+  // Reads never write back: a read-triggered write would race a genuine one
+  // from another window for no benefit at all.
+  return migrateCollectionTree(stored && stored[COLLECTIONS_KEY]);
+}
+
+/**
+ * queueCollectionWrite(mutate)
+ *
+ * Every collection write goes through here so read-modify-write cycles can't
+ * interleave — the same shape as saveTabForLater() would lose updates if two
+ * writes overlapped.
+ *
+ * `mutate` gets the freshly-read tree and returns a new one, or the same
+ * reference / null to mean "nothing to do" (no write, no storage event).
+ *
+ * Callers must call noteSelfMutation() synchronously BEFORE this, so the
+ * suppression window is already open when the onChanged echo arrives — the
+ * echo can beat the promise chain.
+ *
+ * Chrome offers no compare-and-swap on storage.local, so two windows writing
+ * at the same instant is still last-writer-wins. That window is now
+ * sub-millisecond rather than spanning an await, and there is no way to close
+ * it completely — pretending otherwise would be worse than saying so.
+ */
+function queueCollectionWrite(mutate) {
+  const run = collectionsWriteChain.then(async () => {
+    const tree = await getCollections();
+    const next = mutate(tree);
+    if (!next || next === tree) return tree;
+    await chrome.storage.local.set({ [COLLECTIONS_KEY]: next });
+    return next;
+  });
+
+  // One failed write must not wedge every later write in the chain
+  collectionsWriteChain = run.catch(() => {});
+  return run;
+}
+
+
+/* ---- walking the tree --------------------------------------------- */
+
+/** The name to show for a node, with the fallbacks the tree relies on. */
+function displayCollectionName(node) {
+  const name = (node.name || '').trim();
+  if (name) return name;
+
+  if (node.type === 'link')    return node.url || '(unnamed link)';
+  if (node.type === 'note')    return collectionFirstLine(node.text) || '(empty note)';
+  if (node.type === 'snippet') return collectionFirstLine(node.code) || '(empty snippet)';
+  return 'Untitled group';
+}
+
+/**
+ * findCollectionNode(tree, id)
+ *
+ * → { node, parentId, index } or null. `index` is the position among its
+ * siblings, which is what drop-position maths needs.
+ */
+function findCollectionNode(tree, id) {
+  let result = null;
+
+  (function walk(nodes, parentId) {
+    if (result) return;
+    const list = nodes || [];
+    for (let i = 0; i < list.length; i++) {
+      const node = list[i];
+      if (String(node.id) === String(id)) {
+        result = { node, parentId, index: i };
+        return;
+      }
+      if (node.type === 'group') walk(node.children, node.id);
+      if (result) return;
+    }
+  })(tree && tree.nodes, null);
+
+  return result;
+}
+
+/** Every id in a subtree, the node itself first. */
+function collectCollectionIds(node) {
+  if (!node) return [];
+  const ids = [String(node.id)];
+  if (node.type === 'group') {
+    for (const child of node.children || []) ids.push(...collectCollectionIds(child));
+  }
+  return ids;
+}
+
+/** True only for a STRICT descendant — a node is not its own descendant. */
+function isCollectionDescendant(tree, ancestorId, candidateId) {
+  if (String(ancestorId) === String(candidateId)) return false;
+  const found = findCollectionNode(tree, ancestorId);
+  if (!found || found.node.type !== 'group') return false;
+  return collectCollectionIds(found.node).slice(1).includes(String(candidateId));
+}
+
+/**
+ * flattenCollectionTree(tree)
+ *
+ * Depth-first pre-order, with each group's path pre-joined for the "Add to"
+ * select. Uses " / " because that's how the paths people paste around here
+ * are written (`wsj/d2d_mem/mid-0901-1`).
+ */
+function flattenCollectionTree(tree) {
+  const out = [];
+
+  (function walk(nodes, depth, parentId, prefix) {
+    const list = nodes || [];
+    for (let i = 0; i < list.length; i++) {
+      const node = list[i];
+      const name = displayCollectionName(node);
+      const path = prefix ? `${prefix} / ${name}` : name;
+
+      out.push({
+        id: node.id, type: node.type, name: node.name,
+        depth, parentId, index: i, path,
+        hasChildren: node.type === 'group' && (node.children || []).length > 0,
+        collapsed: !!node.collapsed,
+      });
+
+      if (node.type === 'group') walk(node.children, depth + 1, node.id, path);
+    }
+  })(tree && tree.nodes, 0, null, '');
+
+  return out;
+}
+
+/** The full "a / b / c" path to a node, inclusive. '' when it isn't found. */
+function collectionPathOf(tree, id) {
+  const trail = [];
+
+  (function walk(nodes, prefix) {
+    for (const node of nodes || []) {
+      const name = displayCollectionName(node);
+      const path = prefix ? `${prefix} / ${name}` : name;
+      if (String(node.id) === String(id)) { trail.push(path); return true; }
+      if (node.type === 'group' && walk(node.children, path)) return true;
+    }
+    return false;
+  })(tree && tree.nodes, '');
+
+  return trail[0] || '';
+}
+
+function countCollectionNodes(tree) {
+  let groups = 0;
+  let items  = 0;
+
+  (function walk(nodes) {
+    for (const node of nodes || []) {
+      if (node.type === 'group') { groups++; walk(node.children); } else { items++; }
+    }
+  })(tree && tree.nodes);
+
+  return { groups, items };
+}
+
+/**
+ * nextCollectionId(tree)
+ *
+ * Derived from the tree's own contents every time, never stored. A persisted
+ * counter is state that can drift out of step with the tree, and when it does
+ * you get two nodes sharing an id — which silently makes rename and drag act
+ * on the wrong node. (Date.now() is no good here either: two adds in the same
+ * millisecond collide.)
+ */
+function nextCollectionId(tree) {
+  let max = 0;
+
+  (function walk(nodes) {
+    for (const node of nodes || []) {
+      const n = Number(node.id);
+      if (Number.isFinite(n) && n > max) max = n;
+      if (node.type === 'group') walk(node.children);
+    }
+  })(tree && tree.nodes);
+
+  return String(max + 1);
+}
+
+
+/* ---- structural edits (all pure) ---------------------------------- */
+
+function clampCollectionIndex(index, length) {
+  const n = Number.isFinite(index) ? Math.trunc(index) : length;
+  return Math.max(0, Math.min(n, length));
+}
+
+/**
+ * updateCollectionNodes(nodes, id, updater)
+ *
+ * New node array with the matching node replaced by updater(node), or null if
+ * no such node exists. Untouched siblings keep their identity (structural
+ * sharing), so this is cheap and nothing is copied that didn't change.
+ */
+function updateCollectionNodes(nodes, id, updater) {
+  let found = false;
+  const next = [];
+
+  for (const node of nodes || []) {
+    if (String(node.id) === String(id)) {
+      found = true;
+      const replaced = updater(node);
+      if (replaced) next.push(replaced);
+      continue;
+    }
+    if (node.type === 'group' && (node.children || []).length) {
+      const kids = updateCollectionNodes(node.children, id, updater);
+      if (kids) {
+        next.push(Object.assign({}, node, { children: kids }));
+        found = true;
+        continue;
+      }
+    }
+    next.push(node);
+  }
+
+  return found ? next : null;
+}
+
+/** New node array without the matching node (and its subtree), or null. */
+function removeCollectionNodes(nodes, id) {
+  let found = false;
+  const next = [];
+
+  for (const node of nodes || []) {
+    if (String(node.id) === String(id)) { found = true; continue; }
+    if (node.type === 'group' && (node.children || []).length) {
+      const kids = removeCollectionNodes(node.children, id);
+      if (kids) {
+        next.push(Object.assign({}, node, { children: kids }));
+        found = true;
+        continue;
+      }
+    }
+    next.push(node);
+  }
+
+  return found ? next : null;
+}
+
+// parentId === null means the root level
+function insertCollectionNodes(nodes, parentId, index, inserted) {
+  if (parentId === null || parentId === undefined) {
+    const next = (nodes || []).slice();
+    next.splice(clampCollectionIndex(index, next.length), 0, inserted);
+    return next;
+  }
+
+  let done = false;
+  const next = [];
+
+  for (const node of nodes || []) {
+    if (!done && node.type === 'group' && String(node.id) === String(parentId)) {
+      const kids = (node.children || []).slice();
+      kids.splice(clampCollectionIndex(index, kids.length), 0, inserted);
+      next.push(Object.assign({}, node, { children: kids }));
+      done = true;
+      continue;
+    }
+    if (!done && node.type === 'group' && (node.children || []).length) {
+      const kids = insertCollectionNodes(node.children, parentId, index, inserted);
+      if (kids) {
+        next.push(Object.assign({}, node, { children: kids }));
+        done = true;
+        continue;
+      }
+    }
+    next.push(node);
+  }
+
+  return done ? next : null;
+}
+
+
+/* ---- the operations the UI performs ------------------------------- */
+
+/**
+ * addCollectionLink(tree, { url, name, groupId, favIconUrl, addedAt })
+ *
+ * → { tree, id }, or null when the target group no longer exists (the caller
+ * falls back to the root and re-resolves, rather than filing it somewhere
+ * surprising).
+ *
+ * An empty name is stored as '' and resolved by displayCollectionName() at
+ * render time, so "no name yet" stays distinguishable from a real one.
+ */
+/** Shared by every add* helper: assign an id, insert at the end, report it. */
+function insertCollectionItem(tree, parentId, fields) {
+  const id     = nextCollectionId(tree);
+  const parent = (parentId === null || parentId === undefined || parentId === '')
+    ? null : String(parentId);
+
+  const nodes = insertCollectionNodes(
+    tree.nodes, parent, Number.MAX_SAFE_INTEGER, Object.assign({ id }, fields));
+  if (!nodes) return null;
+
+  return { tree: Object.assign({}, tree, { nodes }), id };
+}
+
+/** The four shapes a new leaf can take, so the add helpers stay one-liners. */
+function collectionItemFields(opts) {
+  const options = opts || {};
+  return {
+    name:    typeof options.name === 'string' ? options.name : '',
+    status:  normalizeCollectionStatus(options.status),
+    addedAt: typeof options.addedAt === 'string' ? options.addedAt : '',
+  };
+}
+
+function addCollectionLink(tree, options) {
+  const opts = options || {};
+  if (typeof opts.url !== 'string' || !opts.url) return null;
+
+  return insertCollectionItem(tree, opts.groupId, Object.assign(collectionItemFields(opts), {
+    type: 'link',
+    url:  opts.url,
+    favIconUrl: typeof opts.favIconUrl === 'string' ? opts.favIconUrl : '',
+  }));
+}
+
+function addCollectionNote(tree, options) {
+  const opts = options || {};
+  const text = typeof opts.text === 'string' ? opts.text : '';
+  if (!text.trim()) return null;
+
+  return insertCollectionItem(tree, opts.groupId, Object.assign(collectionItemFields(opts), {
+    type: 'note',
+    text,
+  }));
+}
+
+function addCollectionSnippet(tree, options) {
+  const opts = options || {};
+  const code = typeof opts.code === 'string' ? opts.code : '';
+  if (!code.trim()) return null;
+
+  return insertCollectionItem(tree, opts.groupId, Object.assign(collectionItemFields(opts), {
+    type: 'snippet',
+    code,
+    language: typeof opts.language === 'string' ? opts.language : '',
+  }));
+}
+
+function addCollectionGroup(tree, options) {
+  const opts = options || {};
+  const id     = nextCollectionId(tree);
+  const parent = (opts.parentId === null || opts.parentId === undefined || opts.parentId === '')
+    ? null : String(opts.parentId);
+
+  const node = {
+    id, type: 'group',
+    name: typeof opts.name === 'string' ? opts.name : '',
+    collapsed: false,
+    span: normalizeCollectionSpan(opts.span),
+    children: [],
+  };
+
+  const nodes = insertCollectionNodes(tree.nodes, parent, Number.MAX_SAFE_INTEGER, node);
+  if (!nodes) return null;
+
+  return { tree: Object.assign({}, tree, { nodes }), id };
+}
+
+function renameCollectionNode(tree, id, name) {
+  const nodes = updateCollectionNodes(tree.nodes, id, node =>
+    Object.assign({}, node, { name: String(name) }));
+  return nodes ? Object.assign({}, tree, { nodes }) : null;
+}
+
+function deleteCollectionNode(tree, id) {
+  const nodes = removeCollectionNodes(tree.nodes, id);
+  return nodes ? Object.assign({}, tree, { nodes }) : null;
+}
+
+function setCollectionNodeCollapsed(tree, id, collapsed) {
+  const nodes = updateCollectionNodes(tree.nodes, id, node =>
+    node.type === 'group' ? Object.assign({}, node, { collapsed: !!collapsed }) : node);
+  return nodes ? Object.assign({}, tree, { nodes }) : null;
+}
+
+// What an auto-created group is named, per kind of entry going into it
+const COLLECTION_AUTO_GROUP_PREFIX = { link: 'Link', note: 'Note', snippet: 'Code' };
+
+/**
+ * nextCollectionAutoGroupName(tree, kind)
+ *
+ * The next free `Link3` / `Note1` / `Code2`. Skips names already in use, so an
+ * auto group never collides with one you named yourself.
+ */
+function nextCollectionAutoGroupName(tree, kind) {
+  const prefix = COLLECTION_AUTO_GROUP_PREFIX[kind] || 'Item';
+  const taken  = new Set(flattenCollectionTree(tree).map(entry => String(entry.name || '').trim()));
+
+  let n = 1;
+  while (taken.has(`${prefix}${n}`)) n++;
+  return `${prefix}${n}`;
+}
+
+/**
+ * collectionWrapTopLevel(tree, parentId, kind)
+ *
+ * An entry headed for the top level gets a group of its own instead of sitting
+ * loose on the board. The board is made of cards, and a bare chip among them
+ * both looked wrong and — before tiles all got a measured row span — overlapped
+ * its neighbours.
+ *
+ * One group per add, not per entry: pasting twenty lines makes one group with
+ * twenty entries, not twenty groups.
+ *
+ * → { tree, parentId }
+ */
+function collectionWrapTopLevel(tree, parentId, kind) {
+  const explicit = (parentId && findCollectionNode(tree, parentId)) ? String(parentId) : null;
+  if (explicit !== null) return { tree, parentId: explicit };
+
+  const made = addCollectionGroup(tree, {
+    name: nextCollectionAutoGroupName(tree, kind),
+    parentId: null,
+  });
+  if (!made) return { tree, parentId: null };
+
+  return { tree: made.tree, parentId: made.id };
+}
+
+function setCollectionNodeStatus(tree, id, status) {
+  const nodes = updateCollectionNodes(tree.nodes, id, node =>
+    // Groups have no status of their own; a status filter reaches their
+    // children, not them.
+    node.type === 'group' ? node : Object.assign({}, node, { status: normalizeCollectionStatus(status) }));
+  return nodes ? Object.assign({}, tree, { nodes }) : null;
+}
+
+/**
+ * findCollectionDuplicates(tree, value)
+ *
+ * Every leaf already holding this exact value, with its path — so the caller
+ * can say *where* the thing already lives rather than just refusing.
+ */
+function findCollectionDuplicates(tree, value) {
+  const wanted = String(value || '').trim();
+  if (!wanted) return [];
+
+  const found = [];
+  (function walk(nodes, prefix) {
+    for (const node of nodes || []) {
+      const name = displayCollectionName(node);
+      const path = prefix ? `${prefix} / ${name}` : name;
+      if (node.type === 'group') { walk(node.children, path); continue; }
+      if (collectionNodeValue(node) === wanted) found.push({ id: node.id, path });
+    }
+  })(tree && tree.nodes, '');
+
+  return found;
+}
+
+/**
+ * filterCollectionTree(tree, query, status)
+ *
+ * → a pruned copy holding only what matches, plus the ancestors needed to show
+ * where it lives. A group whose own name matches keeps its whole subtree —
+ * narrowing to "this group" and then hiding its contents would be perverse.
+ *
+ * Kept groups come back expanded, so a match can never be hidden inside a
+ * collapsed parent. Pure, so the matching rules are testable without a DOM.
+ */
+function filterCollectionTree(tree, query, status) {
+  const q              = String(query || '').trim().toLowerCase();
+  const wantedStatus   = normalizeCollectionStatus(status);
+  if (!q && !wantedStatus) return tree;
+
+  const matches = (node) => {
+    if (wantedStatus && node.status !== wantedStatus) return false;
+    if (!q) return true;
+    return [node.name, node.url, node.text, node.code, node.language]
+      .some(value => typeof value === 'string' && value.toLowerCase().includes(q));
+  };
+
+  function prune(nodes) {
+    const kept = [];
+    for (const node of nodes || []) {
+      if (node.type === 'group') {
+        if (matches(node)) { kept.push(node); continue; }
+        const children = prune(node.children);
+        if (children.length) kept.push(Object.assign({}, node, { children, collapsed: false }));
+        continue;
+      }
+      if (matches(node)) kept.push(node);
+    }
+    return kept;
+  }
+
+  return Object.assign({}, tree, { nodes: prune(tree.nodes) });
+}
+
+function setCollectionNodeSpan(tree, id, span) {
+  const nodes = updateCollectionNodes(tree.nodes, id, node =>
+    node.type === 'group' ? Object.assign({}, node, { span: normalizeCollectionSpan(span) }) : node);
+  return nodes ? Object.assign({}, tree, { nodes }) : null;
+}
+
+/**
+ * collectionMoveTargets(tree, id)
+ *
+ * Everywhere a node could move to: the top level, plus every group that is
+ * neither the node itself nor inside it. Offering an invalid destination would
+ * let the UI present a move the model then silently refuses.
+ */
+function collectionMoveTargets(tree, id) {
+  const found = findCollectionNode(tree, id);
+  if (!found) return [];
+
+  const excluded = new Set(collectCollectionIds(found.node));
+
+  const targets = [{ id: '', label: 'Top level' }];
+  for (const entry of flattenCollectionTree(tree)) {
+    if (entry.type !== 'group' || excluded.has(String(entry.id))) continue;
+    targets.push({ id: entry.id, label: entry.path });
+  }
+  return targets;
+}
+
+/**
+ * reparentCollectionNode(tree, id, parentId)
+ *
+ * Moves a node to the END of another group (or to the top level, for an empty
+ * parentId). Distinct from moveCollectionNode(), which places a node relative
+ * to a sibling for drag-and-drop; this one answers "put it in there".
+ *
+ * → a new tree; null if the move is impossible (unknown node, unknown parent,
+ * or a group being dropped inside itself); the SAME reference when the node is
+ * already the last child of that parent, so callers can skip the write.
+ */
+function isValidCollectionReparent(tree, id, parentId) {
+  const found = findCollectionNode(tree, id);
+  if (!found) return false;
+
+  const dest = (parentId === null || parentId === undefined || parentId === '')
+    ? null : String(parentId);
+
+  if (dest === null) return true;
+  if (dest === String(id)) return false;
+  if (isCollectionDescendant(tree, id, dest)) return false;
+
+  const parent = findCollectionNode(tree, dest);
+  return !!(parent && parent.node.type === 'group');
+}
+
+function reparentCollectionNode(tree, id, parentId) {
+  // Split per the validator because the cycle check is otherwise invisible: a
+  // cyclic move fails later anyway, when the destination turns out to have been
+  // inside the subtree that was just removed. The outcome alone can't tell you
+  // the guard is doing anything — and without it, correctness would rest on
+  // insertCollectionNodes failing for a missing parent, which is a much thinner
+  // thread than it looks.
+  if (!isValidCollectionReparent(tree, id, parentId)) return null;
+
+  const found = findCollectionNode(tree, id);
+  const dest = (parentId === null || parentId === undefined || parentId === '')
+    ? null : String(parentId);
+
+  let siblings = null;
+  if (dest === null) {
+    siblings = tree.nodes;
+  } else {
+    const parent = findCollectionNode(tree, dest);
+    if (parent && parent.node.type === 'group') siblings = parent.node.children;
+  }
+  if (!Array.isArray(siblings)) return null;
+
+  const alreadyLast = String(found.parentId === null || found.parentId === undefined ? '' : found.parentId)
+                   === String(dest === null ? '' : dest)
+                   && siblings.length > 0
+                   && String(siblings[siblings.length - 1].id) === String(id);
+  if (alreadyLast) return tree;
+
+  const without = removeCollectionNodes(tree.nodes, id);
+  if (!without) return null;
+
+  const nodes = insertCollectionNodes(without, dest, Number.MAX_SAFE_INTEGER, found.node);
+  if (!nodes) return null;
+
+  return Object.assign({}, tree, { nodes });
+}
+
+
+/* ---- drag and drop ------------------------------------------------- */
+
+/**
+ * collectionDropZoneX(rect, clientX)
+ *
+ * Which half of a card the pointer is over, for reordering the board. Pure,
+ * and it takes a rect rather than an event so it can be unit-tested — the
+ * harness has no layout engine, so an event-driven version would test nothing.
+ */
+function collectionDropZoneX(rect, clientX) {
+  if (!rect || typeof rect.left !== 'number' || !rect.width) return 'after';
+  return (clientX - rect.left) / rect.width < 0.5 ? 'before' : 'after';
+}
+
+/**
+ * collectionRowSpan(height, rowUnit, gap)
+ *
+ * How many grid rows a card of this height needs, including the margin that
+ * provides the vertical gap — the span has to cover both or the next card
+ * would sit on top of it.
+ *
+ * Pure, like the other layout maths: the test harness has no layout engine, so
+ * an inline version would test nothing.
+ */
+function collectionRowSpan(height, rowUnit, gap) {
+  if (!Number.isFinite(height) || height <= 0) return 1;
+  if (!Number.isFinite(rowUnit) || rowUnit <= 0) return 1;
+
+  const spacing = Number.isFinite(gap) && gap > 0 ? gap : 0;
+  return Math.max(1, Math.ceil((height + spacing) / rowUnit));
+}
+
+/**
+ * collectionSpanFromDrag(startWidth, dx, colUnit, gap, maxColumns)
+ *
+ * The number of columns a card snaps to while its right edge is dragged.
+ * Widths land on whole columns so card edges always line up with the grid —
+ * a freely-dragged width would leave the board ragged.
+ *
+ * Pure for the same reason as collectionDropZoneX.
+ */
+function collectionSpanFromDrag(startWidth, dx, colUnit, gap, maxColumns) {
+  // Guard the column width itself: a zero unit would divide into a huge span
+  // and clamp to the maximum, silently blowing the card up instead of leaving
+  // it alone.
+  if (!Number.isFinite(colUnit) || colUnit <= 0) return 1;
+
+  const unit = colUnit + (Number.isFinite(gap) ? gap : 0);
+  const span = Math.round((startWidth + dx + gap) / unit);
+  return Math.max(1, Math.min(maxColumns, span));
+}
+
+/**
+ * isValidCollectionMove(tree, dragId, targetId, position)
+ *
+ * Split out from resolveCollectionDrop() so a caller (and a test) can tell
+ * *why* a move was refused rather than just that it was.
+ */
+function isValidCollectionMove(tree, dragId, targetId, position) {
+  if (String(dragId) === String(targetId)) return false;
+  if (!findCollectionNode(tree, dragId)) return false;
+
+  // The one that matters: dragging a group into its own subtree would detach
+  // that subtree from the tree entirely.
+  if (isCollectionDescendant(tree, dragId, targetId)) return false;
+
+  const target = findCollectionNode(tree, targetId);
+  if (!target) return false;
+  if (position === 'inside' && target.node.type !== 'group') return false;
+
+  return true;
+}
+
+/** → { parentId, index } | null */
+function resolveCollectionDrop(tree, dragId, targetId, position) {
+  if (!isValidCollectionMove(tree, dragId, targetId, position)) return null;
+
+  const target = findCollectionNode(tree, targetId);
+  const parentId = (target.parentId === null || target.parentId === undefined)
+    ? null : String(target.parentId);
+
+  if (position === 'inside') {
+    return { parentId: String(targetId), index: target.node.children.length };
+  }
+  return { parentId, index: target.index + (position === 'after' ? 1 : 0) };
+}
+
+/**
+ * moveCollectionNode(tree, dragId, targetId, position)
+ *
+ * → a new tree, or null if the move is invalid. A move that would change
+ * nothing returns the SAME reference, so the caller can tell "nothing
+ * happened" (skip the write and the self-mutation window) from "invalid".
+ */
+function moveCollectionNode(tree, dragId, targetId, position) {
+  const dest = resolveCollectionDrop(tree, dragId, targetId, position);
+  if (!dest) return null;
+
+  const found = findCollectionNode(tree, dragId);
+  if (!found) return null;
+
+  const sameParent = String(found.parentId === null || found.parentId === undefined ? '' : found.parentId)
+                  === String(dest.parentId === null ? '' : dest.parentId);
+
+  // Removing the dragged node shifts every later sibling left by one, so an
+  // index past its old home has to come back by one.
+  const shiftsBack = sameParent && dest.index > found.index;
+  const finalIndex = shiftsBack ? dest.index - 1 : dest.index;
+
+  if (sameParent && finalIndex === found.index) return tree;   // no-op
+
+  const without = removeCollectionNodes(tree.nodes, dragId);
+  if (!without) return null;
+
+  const nodes = insertCollectionNodes(without, dest.parentId, finalIndex, found.node);
+  if (!nodes) return null;
+
+  return Object.assign({}, tree, { nodes });
 }
 
 
@@ -799,6 +1761,14 @@ const ICONS = {
   tabs:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3 8.25V18a2.25 2.25 0 0 0 2.25 2.25h13.5A2.25 2.25 0 0 0 21 18V8.25m-18 0V6a2.25 2.25 0 0 1 2.25-2.25h13.5A2.25 2.25 0 0 1 21 6v2.25m-18 0h18" /></svg>`,
   close:   `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>`,
   chevron: `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" /></svg>`,
+  plus:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>`,
+  folder:  `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12.75V12A2.25 2.25 0 0 1 4.5 9.75h15A2.25 2.25 0 0 1 21.75 12v.75m-8.69-6.44-2.12-2.12a1.5 1.5 0 0 0-1.061-.44H4.5A2.25 2.25 0 0 0 2.25 6v12a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9a2.25 2.25 0 0 0-2.25-2.25h-5.379a1.5 1.5 0 0 1-1.06-.44Z" /></svg>`,
+  move:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M4 12h14m0 0-5-5m5 5-5 5" /></svg>`,
+  note:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h10" /></svg>`,
+  code:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m9 8-4 4 4 4m6-8 4 4-4 4" /></svg>`,
+  copy:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 0 1-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H6.75a9.06 9.06 0 0 1 1.5.124m7.5 10.376h3.375c.621 0 1.125-.504 1.125-1.125V11.25c0-4.46-3.243-8.161-7.5-8.876a9.06 9.06 0 0 0-1.5-.124H9.375c-.621 0-1.125.504-1.125 1.125v3.5m7.5 10.375H9.375a1.125 1.125 0 0 1-1.125-1.125v-9.25m12 6.625v-1.875a3.375 3.375 0 0 0-3.375-3.375h-1.5a1.125 1.125 0 0 1-1.125-1.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H9.75" /></svg>`,
+  pencil:  `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L10.582 16.07a4.5 4.5 0 0 1-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 0 1 1.13-1.897l8.932-8.931Zm0 0L19.5 7.125" /></svg>`,
+  trash:   `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" /></svg>`,
 };
 
 // Chrome's TabGroupColor values. Used as a whitelist so a group color is
@@ -1016,6 +1986,9 @@ function renderChip(tab, urlCounts) {
       ${faviconHtml(tab, hostname)}
       <span class="chip-text">${escapeHtml(label)}</span>${dupeTag}
       <div class="chip-actions">
+        <button class="chip-action chip-collect" data-action="collect-tab" data-tab-id="${tab.id}" title="Collect into your library — leaves the tab open">
+          ${ICONS.folder}
+        </button>
         <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-id="${tab.id}" title="Save for later">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>
         </button>
@@ -1124,6 +2097,8 @@ function renderGroupCard(group) {
         Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}
       </button>`;
   }
+
+  actionsHtml += renderGroupCollectBtn(group);
 
   const label = groupLabel(group);
   const color = GROUP_COLORS[group.color] ? group.color : 'grey';
@@ -1285,6 +2260,1190 @@ function renderArchiveItem(item) {
 
 
 /* ----------------------------------------------------------------
+   COLLECTED TABS — rendering
+   ---------------------------------------------------------------- */
+
+/**
+ * safeCollectionHref(url)
+ *
+ * Only a URL with a scheme we're willing to follow becomes a link. A
+ * whitelist rather than a blacklist, so javascript:, data:, vbscript: and
+ * chrome-extension: all fall out for free.
+ *
+ * The scheme-less case is the one that matters. A value like
+ * `wsj/d2d_mem/mid-0901-1` would otherwise become <a href="wsj/…">, which on
+ * chrome-extension://<id>/index.html resolves to a path *inside the
+ * extension* — so clicking it either 404s or navigates the new-tab page away
+ * and loses you the whole dashboard. Those entries render as plain text.
+ *
+ * Guessing a base URL would be worse than not linking: the app has no way to
+ * know whether that value is a repo path, a task id or a note, and a
+ * confidently wrong link is worse than an honest non-link.
+ */
+/**
+ * collectionLinkPrefixes()
+ *
+ * Personal mappings from a bare path prefix onto a base URL, read from
+ * config.local.js:
+ *
+ *   const LOCAL_LINK_PREFIXES = { 'wsj/': 'https://tracker.internal/' };
+ *
+ * This is what turns entries like `wsj/d2d_mem/mid-0901-1` — stored without a
+ * scheme because that's how they were copied — into real links. Sorted longest
+ * prefix first so a more specific mapping wins.
+ */
+function collectionLinkPrefixes() {
+  const configured = typeof LOCAL_LINK_PREFIXES !== 'undefined' ? LOCAL_LINK_PREFIXES : null;
+  if (!configured || typeof configured !== 'object' || Array.isArray(configured)) return [];
+
+  return Object.entries(configured)
+    .filter(([prefix, base]) =>
+      typeof prefix === 'string' && prefix &&
+      typeof base === 'string' && /^https?:/i.test(base))
+    .sort((a, b) => b[0].length - a[0].length);
+}
+
+function safeCollectionHref(url) {
+  const raw = String(url || '').trim();
+  if (/^https?:/i.test(raw)) return raw;
+
+  for (const [prefix, base] of collectionLinkPrefixes()) {
+    if (!raw.startsWith(prefix)) continue;
+    return base.replace(/\/+$/, '') + '/' + raw.slice(prefix.length).replace(/^\/+/, '');
+  }
+
+  return '';
+}
+
+/** A favicon, but only when there is one — manual entries have no tab behind them. */
+function collectionFaviconHtml(node) {
+  const src = usableFaviconUrl(node.favIconUrl);
+  if (!src) return '';
+
+  let host = '';
+  try { host = new URL(node.url).hostname; } catch {}
+
+  return `<img class="chip-favicon collection-favicon" src="${escapeHtml(src)}" alt="" width="14" height="14" loading="lazy" referrerpolicy="no-referrer" draggable="false" data-host="${escapeHtml(host)}">`;
+}
+
+/**
+ * renderCollectionName(node, wrap)
+ *
+ * The name, or the rename field when this node is being edited. `wrap` lets a
+ * link render its name as an anchor without needing a second code path.
+ */
+/**
+ * renderCollectionMoveSelect(node)
+ *
+ * The "move to another group" control, which takes over the name slot the same
+ * way the rename field does. Options come from collectionMoveTargets(), so an
+ * invalid destination (the node itself, or anything inside it) is never
+ * offered in the first place.
+ */
+function renderCollectionMoveSelect(node) {
+  const found   = findCollectionNode(collectionTreeForRender, node.id);
+  const current = (found && found.parentId !== null && found.parentId !== undefined)
+    ? String(found.parentId) : '';
+
+  const options = collectionMoveTargets(collectionTreeForRender, node.id)
+    .map(target => {
+      const selected = target.id === current ? ' selected' : '';
+      return `<option value="${escapeHtml(target.id)}"${selected}>${escapeHtml(target.label)}</option>`;
+    })
+    .join('');
+
+  return `<select class="collection-rename collection-move" id="collection-move-${escapeHtml(node.id)}" data-action="collection-edit-field" draggable="false" aria-label="Move to">${options}</select>`;
+}
+
+function renderCollectionName(node, cssClass) {
+  if (editingCollectionNodeId === String(node.id)) {
+    if (editingCollectionMode === 'move') return renderCollectionMoveSelect(node);
+
+    // data-action on the field matters: it lives inside a clickable row, and
+    // without its own action a click into it would be read as a click on the
+    // row underneath — which on a link chip means opening the link.
+    return `<input class="collection-rename" id="collection-rename-${escapeHtml(node.id)}" type="text" spellcheck="false" aria-label="Name" data-action="collection-edit-field" draggable="false" data-rename-session="${renameSession}" value="${escapeHtml(renameDraft)}">`;
+  }
+
+  // A nameless note or snippet shows its body instead of a title — the
+  // first-line fallback would just repeat what's underneath it.
+  const isBody = node.type === 'note' || node.type === 'snippet';
+  if (isBody && !(node.name || '').trim()) return '';
+
+  return `<span class="${cssClass}">${escapeHtml(displayCollectionName(node))}</span>`;
+}
+
+function renderCollectionRowActions(node) {
+  const id = escapeHtml(node.id);
+  const addHere = node.type === 'group'
+    ? `<button class="collection-action" type="button" draggable="false" data-action="add-collection-here" data-node-id="${id}" title="Add a link to this group">${ICONS.plus}</button>`
+    : '';
+
+  return `<span class="collection-row-actions">
+      ${addHere}<button class="collection-action" type="button" draggable="false" data-action="move-collection-node" data-node-id="${id}" title="Move to another group">${ICONS.move}</button><button class="collection-action" type="button" draggable="false" data-action="rename-collection-node" data-node-id="${id}" title="Rename">${ICONS.pencil}</button><button class="collection-action is-danger" type="button" draggable="false" data-action="delete-collection-node" data-node-id="${id}" title="Delete">${ICONS.trash}</button>
+    </span>`;
+}
+
+/** "3 groups · 2 items" — the card's badge. */
+function describeCollectionChildren(node) {
+  const children = node.children || [];
+  const groups = children.filter(c => c.type === 'group').length;
+  const items  = children.filter(c => c.type !== 'group').length;
+
+  const parts = [];
+  if (groups) parts.push(`${groups} group${groups !== 1 ? 's' : ''}`);
+  if (items)  parts.push(`${items} item${items !== 1 ? 's' : ''}`);
+  return parts.join(' · ') || 'empty';
+}
+
+// Only top-level groups are coloured, cycling the same palette the Open tabs
+// cards use for Chrome's own group colours. Deeper cards stay neutral so a
+// nested one never competes with the card containing it.
+const COLLECTION_COLOR_CYCLE = ['blue', 'green', 'purple', 'orange', 'cyan', 'pink', 'red', 'yellow', 'grey'];
+
+function collectionDepthClass(depth) {
+  if (depth === 0) return 'is-depth-0';
+  if (depth === 1) return 'is-depth-1';
+  return 'is-deep';
+}
+
+function renderCollectionNodes(nodes, depth, columns) {
+  let groupIndex = 0;
+
+  return (nodes || []).map(node => {
+    if (node.type !== 'group') return renderCollectionItemChip(node, depth);
+
+    const color = COLLECTION_COLOR_CYCLE[groupIndex % COLLECTION_COLOR_CYCLE.length];
+    groupIndex++;
+    return renderCollectionGroupNode(node, depth, color, columns);
+  }).join('');
+}
+
+/**
+ * renderCollectionGroupNode(node, depth, accentColor)
+ *
+ * A group IS a .mission-card — the very same class the Open tabs cards use, so
+ * the card language (top accent bar, header, badge, chips) is shared rather
+ * than reimplemented and the two sections can't drift apart.
+ *
+ * Depth only ever subtracts from that: first the shadow goes, then the top bar
+ * becomes a side accent. Nesting is real containment, so nothing has to be
+ * indented by hand.
+ */
+function renderCollectionGroupNode(node, depth, accentColor, columns) {
+  const collapsed  = !!node.collapsed;
+  const confirming = pendingDeleteId === String(node.id) ? ' is-confirming' : '';
+  const colorAttr  = accentColor ? ` data-group-color="${accentColor}"` : '';
+
+  // Only top-level cards live on the board, so only they get a span and a
+  // resize edge. Nested cards stack inside their parent, and a span is clamped
+  // to the columns that actually exist — span 4 in a 2-column grid would push
+  // the card into an implicit column and break the layout.
+  const onBoard = depth === 0;
+  const span    = onBoard ? Math.min(normalizeCollectionSpan(node.span), columns) : 1;
+
+  const spanAttr = onBoard ? ` style="--card-span:${span}" data-span="${span}"` : '';
+  const dragAttr = onBoard ? ' draggable="true"' : '';
+  // draggable="false" on the handle and the buttons below stops them from
+  // starting a card drag: the drag looks for the nearest draggable ancestor, so
+  // without this, grabbing a button would pick the card up instead.
+  const resizeEdge = onBoard
+    ? `<div class="collection-resize" data-action="resize-collection-card" data-node-id="${escapeHtml(node.id)}" title="Drag to resize" aria-hidden="true" draggable="false"></div>`
+    : '';
+
+  // Collapsing removes the children from the markup entirely rather than
+  // hiding them: no visibility maths, nothing to keep in sync.
+  const children = collapsed ? '' : renderCollectionChildren(node.children, depth, columns);
+
+  return `
+    <div class="mission-card collection-card ${collectionDepthClass(depth)}${collapsed ? ' is-collapsed' : ''}${confirming}" data-node-id="${escapeHtml(node.id)}" data-node-type="group" data-depth="${depth}" role="treeitem" aria-expanded="${!collapsed}" aria-level="${depth + 1}"${colorAttr}${spanAttr}${dragAttr}>
+      <div class="mission-content">
+        <div class="mission-top">
+          <button class="card-collapse-toggle" type="button" data-action="toggle-collection-group" data-node-id="${escapeHtml(node.id)}" aria-label="${collapsed ? 'Expand' : 'Collapse'}">${ICONS.chevron}</button>
+          ${renderCollectionName(node, 'mission-name')}
+          <span class="open-tabs-badge">${ICONS.folder} ${describeCollectionChildren(node)}</span>
+          ${renderCollectionRowActions(node)}
+        </div>${children}
+      </div>${resizeEdge}
+    </div>`;
+}
+
+/**
+ * renderGroupCollectBtn(group)
+ *
+ * The whole-group action, sitting at the right end of the action row rather
+ * than up in the header — it belongs with the other thing you can do to the
+ * entire group.
+ *
+ * Only real Chrome groups get one: the Ungrouped bucket isn't a unit you'd
+ * file away.
+ */
+function renderGroupCollectBtn(group) {
+  if (group.isUngrouped) return '';
+
+  return `
+      <button class="action-btn collect-group" type="button" data-action="collect-group-tabs" data-group-id="${group.id}" title="Collect this whole group into your library — leaves the tabs open">
+        ${ICONS.folder} Collect
+      </button>`;
+}
+
+/**
+ * renderCollectionChildren(children, depth)
+ *
+ * Renders children in the order they were arranged. Links buffer into chip
+ * rows; a subgroup flushes the buffer and emits a nested card — so a link
+ * sitting between two subgroups keeps its place instead of being sorted to
+ * one end of its parent.
+ */
+function renderCollectionChildren(children, depth, columns) {
+  const out = [];
+  let chips = [];
+
+  const flush = () => {
+    if (!chips.length) return;
+    out.push(`<div class="mission-pages">${chips.join('')}</div>`);
+    chips = [];
+  };
+
+  for (const child of children || []) {
+    // Test for a group, not for a link: there are four node kinds, and writing
+    // `=== 'link'` here silently rendered notes and snippets as group cards.
+    if (child.type === 'group') {
+      flush();
+      out.push(renderCollectionGroupNode(child, depth + 1, null, columns));
+    } else {
+      // depth+1: a child of a depth-N group is at depth N+1, same as a nested
+      // group. Passing the parent's depth here made every chip in a top-level
+      // group claim to be a top-level tile.
+      chips.push(renderCollectionItemChip(child, depth + 1));
+    }
+  }
+  flush();
+
+  return `<div class="collection-children">${out.join('')}</div>`;
+}
+
+/**
+ * renderCollectionItemChip(node)
+ *
+ * A link is a .page-chip — the same element a tab is inside an Open tabs card,
+ * so the whole page has one list idiom.
+ *
+ * It's a div with a click action rather than an <a href>, for the same reason
+ * the tab chips are: the row contains buttons, and a button inside an anchor
+ * is invalid markup.
+ */
+const COLLECTION_STATUS_META = {
+  todo:    { label: 'To do',   className: 'is-todo' },
+  doing:   { label: 'Doing',   className: 'is-doing' },
+  done:    { label: 'Done',    className: 'is-done' },
+  dropped: { label: 'Dropped', className: 'is-dropped' },
+};
+
+// Clicking the dot walks this; '' (no status) is part of the cycle
+const COLLECTION_STATUS_ORDER = ['', 'todo', 'doing', 'done', 'dropped'];
+
+function renderCollectionStatus(node) {
+  if (node.type === 'group') return '';
+
+  const status = normalizeCollectionStatus(node.status);
+  const meta   = COLLECTION_STATUS_META[status];
+
+  return `<button class="collection-status${meta ? ` ${meta.className}` : ''}" type="button" draggable="false" data-action="cycle-collection-status" data-node-id="${escapeHtml(node.id)}" data-status="${status}" title="${meta ? `${meta.label} — click to change` : 'No status — click to set one'}" aria-label="${meta ? meta.label : 'No status'}"></button>`;
+}
+
+function collectionItemIcon(node) {
+  if (node.type === 'note')    return `<span class="chip-icon" aria-hidden="true">${ICONS.note}</span>`;
+  if (node.type === 'snippet') return `<span class="chip-icon" aria-hidden="true">${ICONS.code}</span>`;
+  return collectionFaviconHtml(node);
+}
+
+/** Notes and snippets carry a body; a link doesn't. */
+function renderCollectionBody(node) {
+  if (node.type === 'note') {
+    return `<div class="collection-note">${escapeHtml(node.text)}</div>`;
+  }
+
+  if (node.type === 'snippet') {
+    const language = (node.language || '').trim();
+    return `<div class="collection-snippet">${language ? `<span class="collection-lang">${escapeHtml(language)}</span>` : ''}<pre class="collection-code">${escapeHtml(node.code)}</pre></div>`;
+  }
+
+  return '';
+}
+
+/**
+ * renderCollectionItemChip(node)
+ *
+ * Every leaf — link, note or snippet — is a .page-chip, the same element a tab
+ * is inside an Open tabs card, so the page keeps one list idiom. What differs
+ * is the icon, the body, and what clicking the row does.
+ */
+function renderCollectionItemChip(node, depth) {
+  const href = node.type === 'link' ? safeCollectionHref(node.url) : '';
+  const confirming = pendingDeleteId === String(node.id) ? ' is-confirming' : '';
+
+  // A click opens the row if we can resolve an address, and copies it if we
+  // can't. A bare path is a perfectly good entry — it just isn't a link, and
+  // it must not become a relative one (see safeCollectionHref).
+  const value  = collectionNodeValue(node);
+  const action = href ? ' data-action="open-collection-link"'
+                      : ' data-action="copy-collection-node"';
+  const hint   = href || value || displayCollectionName(node);
+
+  return `<div class="page-chip ${href ? 'clickable' : 'is-copyable'}${confirming}"${action} data-node-id="${escapeHtml(node.id)}" data-node-type="${escapeHtml(node.type)}" data-depth="${depth}" title="${escapeHtml(hint)}">
+      ${collectionItemIcon(node)}
+      <div class="collection-item-main">
+        ${renderCollectionName(node, 'chip-text')}
+        ${renderCollectionBody(node)}
+      </div>
+      ${renderCollectionStatus(node)}
+      <div class="chip-actions">
+        <button class="chip-action" type="button" draggable="false" data-action="copy-collection-node" data-node-id="${escapeHtml(node.id)}" title="Copy${node.type === 'link' ? ' this address' : ''}">${ICONS.copy}</button>
+        <button class="chip-action" type="button" draggable="false" data-action="rename-collection-node" data-node-id="${escapeHtml(node.id)}" title="Rename">${ICONS.pencil}</button>
+        <button class="chip-action chip-delete" type="button" draggable="false" data-action="delete-collection-node" data-node-id="${escapeHtml(node.id)}" title="Delete">${ICONS.trash}</button>
+      </div>
+    </div>`;
+}
+
+/**
+ * renderCollectionTargets(tree, selectEl)
+ *
+ * Rebuilds the "Add to" options: every group, depth-first, labelled with its
+ * path. Uses the literal U+00A0 for indent — HTML collapses ordinary spaces
+ * inside <option>, and &nbsp; is not interpreted there either.
+ *
+ * A native <select> is the right control here: Chrome renders the open
+ * dropdown as an OS-level popup, so a live-sync rewrite of the page doesn't
+ * slam it shut mid-selection the way a custom menu would.
+ */
+function renderCollectionTargets(tree, selectEl) {
+  if (!selectEl) return;
+
+  const groups = flattenCollectionTree(tree).filter(entry => entry.type === 'group');
+
+  const options = ['<option value="">Top level</option>'].concat(
+    groups.map((group) => {
+      const indent = "\u00A0\u00A0".repeat(group.depth);
+      const label  = group.path.length > 60 ? `… / ${group.path.slice(-56)}` : group.path;
+      return `<option value="${escapeHtml(group.id)}">${indent}${escapeHtml(label)}</option>`;
+    })
+  ).join('');
+
+  setHTML(selectEl, options);
+
+  // The remembered target may have been deleted (here or in another window).
+  // Re-resolve against the tree we just read rather than trusting the id.
+  const stillExists = groups.some(group => String(group.id) === String(collectTargetId));
+  collectTargetId = stillExists ? String(collectTargetId) : '';
+  selectEl.value = collectTargetId;
+}
+
+async function renderCollectionSection() {
+  // A drag or a resize is in flight. Rewriting the tree now would detach the
+  // very elements the gesture is holding — the drop targets, or the handle the
+  // pointer is captured on.
+  if (collectionDragActive || collectionResize) return;
+
+  const treeEl   = document.getElementById('collectedTree');
+  const countEl  = document.getElementById('collectionsCount');
+  const emptyEl  = document.getElementById('collectionsEmpty');
+  const selectEl = document.getElementById('collectTargetSelect');
+  if (!treeEl) return;
+
+  let tree;
+  try {
+    tree = await getCollections();
+  } catch (err) {
+    console.warn('[tab-out] Could not load collections:', err);
+    return;
+  }
+
+  // The renderers below read this to build the "move to" options — the whole
+  // tree, so a filter doesn't change where a node can be moved to
+  collectionTreeForRender = tree;
+
+  const filtered = filterCollectionTree(tree, collectionQuery, collectionStatusFilter);
+
+  const counts = countCollectionNodes(filtered);
+  setHTML(countEl, (counts.groups + counts.items) > 0
+    ? `${counts.groups} group${counts.groups !== 1 ? 's' : ''} · ${counts.items} item${counts.items !== 1 ? 's' : ''}`
+    : '');
+
+  const columns = collectionColumnCount();
+  setHTML(treeEl, `<div class="collection-board" style="--collection-columns:${columns}">${renderCollectionNodes(filtered.nodes, 0, columns)}</div>`);
+
+  // Same task as the write above, deliberately: reading layout back forces the
+  // browser to lay out before it paints, so the row spans are already right by
+  // the time anything appears on screen and nothing visibly settles.
+  layoutCollectionBoard();
+
+  // Unlike the saved-for-later column, the section itself never hides: the
+  // toolbar is the only way to add the first link.
+  const filtering = !!(collectionQuery.trim() || collectionStatusFilter);
+  const showing   = filtered.nodes.length;
+
+  if (treeEl.style) treeEl.style.display = showing ? 'block' : 'none';
+  if (emptyEl) {
+    if (emptyEl.style) emptyEl.style.display = showing ? 'none' : 'block';
+    emptyEl.textContent = filtering
+      ? 'Nothing matches that filter.'
+      : 'Nothing collected yet. Paste a link above, or hit the folder icon on any tab.';
+  }
+
+  renderCollectionTargets(tree, selectEl);
+}
+
+/**
+ * layoutCollectionBoard()
+ *
+ * Gives every top-level card a row span that matches its content height, so
+ * the board packs cards tightly instead of leaving a hole under each short
+ * one. This is what lets the board be a grid (and therefore support columns
+ * that cards can span) without giving up the tight stacking.
+ *
+ * Cards are align-items: start, so a card's measured height is its content
+ * height whatever span it currently has — re-measuring an already-spanned card
+ * gives the same number back rather than ratcheting.
+ */
+function layoutCollectionBoard() {
+  // Every direct child, not just the group cards: a leaf sitting loose at the
+  // top level is a board tile too, and without a row span it would sit in an
+  // 8px row and overlap its neighbours.
+  const tiles = document.querySelectorAll('.collection-board > *');
+  if (!tiles || !tiles.length) return;
+
+  for (const card of tiles) {
+    const rect = card.getBoundingClientRect ? card.getBoundingClientRect() : null;
+    if (!rect || !rect.height) continue;
+
+    const rows = collectionRowSpan(rect.height, COLLECTION_ROW_UNIT, COLLECTION_BOARD_GAP);
+    if (card.style && typeof card.style.setProperty === 'function') {
+      card.style.setProperty('--row-span', rows);
+    }
+  }
+}
+
+/**
+ * restoreCollectionRenameFocus()
+ *
+ * Called at the end of every render. Most renders don't touch the rename field
+ * at all — setHTML skips the DOM write when the markup is byte-identical, and
+ * "node X is being renamed" being the only thing that changed produces exactly
+ * that. This only matters for the renders that DID rewrite the tree (another
+ * tab opened, a title changed), where the field was replaced underneath you.
+ */
+function restoreCollectionRenameFocus() {
+  if (!editingCollectionNodeId) return;
+
+  const fieldId = editingCollectionMode === 'move'
+    ? `collection-move-${editingCollectionNodeId}`
+    : `collection-rename-${editingCollectionNodeId}`;
+
+  const field = document.getElementById(fieldId);
+  if (!field || typeof field.focus !== 'function') return;
+  if (document.activeElement === field) return;   // already focused; leave it alone
+
+  field.focus();
+
+  // Only the text field has a caret to put back
+  if (editingCollectionMode !== 'rename') return;
+  const caret = renameCaret == null ? String(field.value || '').length : renameCaret;
+  if (typeof field.setSelectionRange === 'function') field.setSelectionRange(caret, caret);
+}
+
+function isCollectionRenameField(el) {
+  return !!(el && typeof el.id === 'string' && el.id.startsWith('collection-rename-'));
+}
+
+
+/* ----------------------------------------------------------------
+   COLLECTED TABS — interactions
+
+   These are driven from the one delegated click handler, and read the node id
+   off the clicked element's own dataset rather than walking up the DOM. That
+   keeps each button unambiguous no matter how the row markup is nested.
+   ---------------------------------------------------------------- */
+
+const COLLECTION_MOVE_PREFIX = 'collection-move-';
+
+function isCollectionMoveField(el) {
+  return !!(el && typeof el.id === 'string' && el.id.startsWith(COLLECTION_MOVE_PREFIX));
+}
+
+/**
+ * finishPendingCollectionEdit()
+ *
+ * Called before opening a different editor. A rename in progress is committed —
+ * that's what clicking away from it normally does — while a move in progress is
+ * simply dropped, since there's nothing half-typed to keep.
+ */
+async function finishPendingCollectionEdit() {
+  if (!editingCollectionNodeId) return;
+  if (editingCollectionMode === 'rename') await commitCollectionRename();
+  else cancelCollectionRename();
+}
+
+async function beginCollectionRename(id) {
+  const nodeId = String(id || '');
+  if (!nodeId) return;
+
+  await finishPendingCollectionEdit();
+
+  const tree  = await getCollections();
+  const found = findCollectionNode(tree, nodeId);
+  if (!found) {
+    await renderCollectionSection();
+    return;
+  }
+
+  pendingDeleteId = null;
+  editingCollectionNodeId = nodeId;
+  editingCollectionMode = 'rename';
+  renameDraft = found.node.name || '';
+  renameCaret = null;              // open with the caret at the end
+  renameSession++;
+
+  await renderCollectionSection();
+  restoreCollectionRenameFocus();
+}
+
+/**
+ * beginCollectionMove(id)
+ *
+ * Opens the "move to" select in place of the node's name. Reuses the rename
+ * machinery deliberately: same slot, same session token, same single editor
+ * at a time — only the control and the commit differ.
+ */
+async function beginCollectionMove(id) {
+  const nodeId = String(id || '');
+  if (!nodeId) return;
+
+  await finishPendingCollectionEdit();
+
+  const tree  = await getCollections();
+  const found = findCollectionNode(tree, nodeId);
+  if (!found) {
+    await renderCollectionSection();
+    return;
+  }
+
+  // Only "Top level" on offer, and it's already there
+  if (collectionMoveTargets(tree, nodeId).length === 1 && found.parentId === null) {
+    showToast('There is nowhere else to move that yet');
+    return;
+  }
+
+  pendingDeleteId = null;
+  editingCollectionNodeId = nodeId;
+  editingCollectionMode = 'move';
+  renameDraft = '';
+  renameCaret = null;
+  renameSession++;
+
+  await renderCollectionSection();
+}
+
+/**
+ * commitCollectionReparent(nodeId, parentId)
+ *
+ * Applies a "move to" choice. A pick that resolves to where the node already
+ * is changes nothing and — because reparentCollectionNode returns the same
+ * tree — writes nothing and says nothing.
+ */
+async function commitCollectionReparent(nodeId, parentId) {
+  renameSession++;                 // any focusout still in flight is now stale
+  editingCollectionNodeId = null;
+  editingCollectionMode = 'rename';
+  renameDraft = '';
+  renameCaret = null;
+
+  noteSelfMutation();
+
+  let moved = false;
+  await queueCollectionWrite(tree => {
+    const next = reparentCollectionNode(tree, nodeId, parentId);
+    if (!next || next === tree) return tree;
+    moved = true;
+    return next;
+  });
+
+  if (moved) {
+    const tree = await getCollections();
+    const path = parentId ? collectionPathOf(tree, parentId) : '';
+    showToast(path ? `Moved into ${path}` : 'Moved to the top level');
+  }
+
+  await renderCollectionSection();
+}
+
+async function commitCollectionRename() {
+  const id = editingCollectionNodeId;
+  if (!id) return;
+  if (editingCollectionMode !== 'rename') return;   // a move has nothing half-typed
+
+  const draft = renameDraft.trim();
+
+  // Bump the session first: our own re-render is about to fire focusout, and
+  // the token is what turns that echo into a no-op.
+  renameSession++;
+  editingCollectionNodeId = null;
+  renameDraft = '';
+  renameCaret = null;
+
+  // An empty name is treated as a cancel — a nameless node can't be told apart
+  // in the "Add to" list. An unchanged name writes nothing at all, so clicking
+  // in and back out doesn't fire a pointless storage event.
+  if (draft) {
+    const tree  = await getCollections();
+    const found = findCollectionNode(tree, id);
+    if (found && (found.node.name || '') !== draft) {
+      noteSelfMutation();
+      await queueCollectionWrite(current => renameCollectionNode(current, id, draft));
+    }
+  }
+
+  await renderCollectionSection();
+  restoreCollectionRenameFocus();
+}
+
+function cancelCollectionRename() {
+  if (!editingCollectionNodeId) return;
+
+  renameSession++;                 // discard any focusout still in flight
+  editingCollectionNodeId = null;
+  editingCollectionMode = 'rename';
+  renameDraft = '';
+  renameCaret = null;
+  renderCollectionSection();
+}
+
+/**
+ * syncCollectionToolbar()
+ *
+ * Keeps the toolbar's static markup in step with the chosen kind. The toolbar
+ * is never rewritten by a render (that's what keeps its fields typable through
+ * a live-sync pass), so this has to be called deliberately.
+ */
+function syncCollectionToolbar() {
+  const kindEl  = document.getElementById('collectKindSelect');
+  const valueEl = document.getElementById('collectUrlInput');
+  const langEl  = document.getElementById('collectLanguageInput');
+
+  const kind = kindEl ? String(kindEl.value || 'link') : 'link';
+
+  // The language only means anything for a snippet
+  if (langEl && langEl.style) langEl.style.display = kind === 'snippet' ? '' : 'none';
+
+  if (valueEl) {
+    valueEl.placeholder = kind === 'note'    ? 'Write a note…'
+                        : kind === 'snippet' ? 'Paste the code or command…'
+                        : 'Paste a link, or a path…';
+  }
+}
+
+/**
+ * addCollectedFromToolbar()
+ *
+ * Adds whatever the toolbar is set to: a link (or a bare path), a note, or a
+ * snippet. For links, several pasted lines become several entries — pasting a
+ * list of run paths in one go is the case worth optimising for.
+ *
+ * An entry whose value is already in the collection is still added, but the
+ * toast names where it already lives, rather than the library silently growing
+ * duplicates.
+ */
+async function addCollectedFromToolbar() {
+  const kindEl  = document.getElementById('collectKindSelect');
+  const valueEl = document.getElementById('collectUrlInput');
+  const nameEl  = document.getElementById('collectNameInput');
+  const langEl  = document.getElementById('collectLanguageInput');
+  if (!valueEl) return;
+
+  const kind  = kindEl ? String(kindEl.value || 'link') : 'link';
+  const value = String(valueEl.value || '').trim();
+  if (!value) {
+    if (typeof valueEl.focus === 'function') valueEl.focus();
+    return;
+  }
+
+  const name     = nameEl ? String(nameEl.value || '').trim() : '';
+  const language = langEl ? String(langEl.value || '').trim() : '';
+
+  // collectTargetId, not the select's DOM value: the render WRITES that
+  // element from this variable, so reading it back would make the element a
+  // second source of truth that can disagree with the first.
+  const target = collectTargetId;
+
+  // Only links split on newlines — a note or a snippet is one multi-line entry
+  const lines = kind === 'link'
+    ? value.split('\n').map(line => line.trim()).filter(Boolean)
+    : [value];
+
+  const at = new Date().toISOString();
+
+  pendingDeleteId = null;
+  noteSelfMutation();
+
+  let added = 0;
+  let landedAt = '';
+  let alreadyThere = '';
+
+  await queueCollectionWrite(tree => {
+    // Re-resolve the destination against the tree we just read: it may have
+    // been deleted, here or in another window. Anything headed for the top
+    // level gets an auto-named group instead.
+    const wrapped = collectionWrapTopLevel(tree, target, kind);
+    const wanted  = wrapped.parentId;
+
+    let next = wrapped.tree;
+    for (const line of lines) {
+      if (!alreadyThere) {
+        const duplicates = findCollectionDuplicates(next, line);
+        if (duplicates.length) alreadyThere = duplicates[0].path;
+      }
+
+      // A paste of several lines doesn't get one shared name
+      const shared = { name: lines.length === 1 ? name : '', groupId: wanted, addedAt: at };
+
+      const result = kind === 'note'
+        ? addCollectionNote(next, Object.assign({ text: line }, shared))
+        : kind === 'snippet'
+          ? addCollectionSnippet(next, Object.assign({ code: line, language }, shared))
+          : addCollectionLink(next, Object.assign({ url: line }, shared));
+
+      if (!result) continue;
+      next = result.tree;
+      added++;
+      if (!landedAt) landedAt = wanted ? collectionPathOf(result.tree, wanted) : '';
+    }
+
+    return next === tree ? tree : next;
+  });
+
+  if (!added) {
+    showToast('Nothing to add');
+    return;
+  }
+
+  valueEl.value = '';
+  if (nameEl) nameEl.value = '';
+  // The kind, destination and language are kept on purpose, so filing a run of
+  // similar entries is type, Enter, type, Enter.
+  syncCollectionToolbar();
+
+  const where = landedAt ? ` to ${landedAt}` : '';
+  showToast(alreadyThere
+    ? `Added ${added}${where} · already in ${alreadyThere}`
+    : `Added ${added}${where}`);
+
+  await renderCollectionSection();
+}
+
+/**
+ * copyCollectionNode(nodeId)
+ *
+ * Copies a leaf's stored value. This is the whole point of a path-shaped
+ * entry: `wsj/d2d_mem/mid-0901-1` isn't a link, but it is exactly what you
+ * want on the clipboard.
+ */
+async function copyCollectionNode(nodeId) {
+  const tree  = await getCollections();
+  const found = findCollectionNode(tree, nodeId);
+  if (!found) return;
+
+  const value = collectionNodeValue(found.node);
+  if (!value) {
+    showToast('Nothing to copy');
+    return;
+  }
+
+  if (typeof navigator === 'undefined' || !navigator.clipboard || !navigator.clipboard.writeText) {
+    showToast('The clipboard is not available here');
+    return;
+  }
+
+  try {
+    await navigator.clipboard.writeText(value);
+    showToast('Copied');
+  } catch (err) {
+    console.warn('[tab-out] Could not write to the clipboard:', err);
+    showToast('Could not copy');
+  }
+}
+
+/**
+ * collectGroupIntoCollection(groupId)
+ *
+ * Files a whole Chrome tab group into the collection as one subgroup, with a
+ * link per tab — the tree equivalent of "collect this tab", for when you're
+ * done with a thread of work and want the whole thing recorded.
+ *
+ * The tabs are not closed, same as collecting a single one.
+ */
+async function collectGroupIntoCollection(groupId) {
+  const tabs = await tabsInGroup(groupId);
+  if (!tabs.length) {
+    showToast('That group has no tabs left to collect');
+    return;
+  }
+
+  const chromeGroups = await fetchChromeGroups();
+  const chromeGroup  = chromeGroups.find(group => group.id === groupId);
+  const name = (chromeGroup && chromeGroup.title) || 'Collected group';
+
+  pendingDeleteId = null;
+  noteSelfMutation();
+
+  const at = new Date().toISOString();
+  let landedAt = '';
+  let collected = 0;
+
+  await queueCollectionWrite(tree => {
+    const wanted = collectTargetId && findCollectionNode(tree, collectTargetId) ? collectTargetId : null;
+
+    const created = addCollectionGroup(tree, { name, parentId: wanted });
+    if (!created) return tree;
+
+    let next = created.tree;
+    for (const tab of tabs) {
+      const result = addCollectionLink(next, {
+        url: tab.url,
+        name: tab.title || tab.url,
+        groupId: created.id,
+        favIconUrl: tab.favIconUrl || '',
+        addedAt: at,
+      });
+      if (!result) continue;
+      next = result.tree;
+      collected++;
+    }
+
+    landedAt = wanted ? collectionPathOf(next, wanted) : '';
+    return next;
+  });
+
+  const where = landedAt ? ` into ${landedAt}` : '';
+  showToast(`Collected ${collected} tab${collected !== 1 ? 's' : ''}${where}`);
+  await renderCollectionSection();
+}
+
+/** Turns the handful of entities a clipboard fragment carries back into text. */
+function decodeCollectionText(value) {
+  return String(value || '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0*39;|&apos;/gi, "'")
+    // last, so a literal "&amp;lt;" doesn't come out as "<"
+    .replace(/&amp;/gi, '&');
+}
+
+/**
+ * extractFirstHyperlink(html)
+ *
+ * Pulls the first anchor out of a clipboard's text/html flavour — the one that
+ * survives a copy from a document or a chat window, where the plain-text
+ * flavour has already dropped the address and left only the words.
+ *
+ * Returns { url, text } or null.
+ *
+ * Deliberately a strict regex rather than DOMParser: the input is one
+ * clipboard fragment, the shape we accept is one anchor, and keeping this a
+ * pure function is what makes it testable at all — the harness has no parser.
+ */
+function extractFirstHyperlink(html) {
+  const source = String(html || '');
+  const anchor = /<a\b[^>]*?href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a\s*>/i.exec(source);
+  if (!anchor) return null;
+
+  const url  = decodeCollectionText(anchor[1]).trim();
+  const text = decodeCollectionText(anchor[2].replace(/<[^>]*>/g, ' '))
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return url ? { url, text } : null;
+}
+
+/** Steps a leaf's status round the cycle, including back to none. */
+async function cycleCollectionStatus(nodeId) {
+  const tree  = await getCollections();
+  const found = findCollectionNode(tree, nodeId);
+  if (!found || found.node.type === 'group') return;
+
+  const current = normalizeCollectionStatus(found.node.status);
+  const next    = COLLECTION_STATUS_ORDER[
+    (COLLECTION_STATUS_ORDER.indexOf(current) + 1) % COLLECTION_STATUS_ORDER.length];
+
+  pendingDeleteId = null;
+  noteSelfMutation();
+  await queueCollectionWrite(current => setCollectionNodeStatus(current, nodeId, next));
+  await renderCollectionSection();
+}
+
+async function addCollectedGroupFromToolbar() {
+  const target = collectTargetId;
+
+  pendingDeleteId = null;
+  noteSelfMutation();
+
+  let newId = null;
+  await queueCollectionWrite(tree => {
+    const wanted = target && findCollectionNode(tree, target) ? target : null;
+    const result = addCollectionGroup(tree, { name: '', parentId: wanted });
+    if (!result) return tree;
+    newId = result.id;
+    return result.tree;
+  });
+
+  // Straight into rename mode, so you can just type the name
+  if (newId) await beginCollectionRename(newId);
+  else       await renderCollectionSection();
+}
+
+async function toggleCollectionGroup(id) {
+  const nodeId = String(id || '');
+  pendingDeleteId = null;
+  noteSelfMutation();
+
+  await queueCollectionWrite(tree => {
+    const found = findCollectionNode(tree, nodeId);
+    if (!found || found.node.type !== 'group') return tree;
+    return setCollectionNodeCollapsed(tree, nodeId, !found.node.collapsed);
+  });
+
+  await renderCollectionSection();
+}
+
+async function deleteCollectionNodeById(id) {
+  const nodeId = String(id || '');
+  if (!nodeId) return;
+
+  // One click arms, a second confirms — a group takes its whole subtree with
+  // it, and this has to survive being triggered by a mis-click.
+  if (pendingDeleteId !== nodeId) {
+    pendingDeleteId = nodeId;
+    showToast('Click the bin again to delete that group and everything inside it');
+    await renderCollectionSection();
+    return;
+  }
+
+  pendingDeleteId = null;
+  noteSelfMutation();
+  await queueCollectionWrite(tree => deleteCollectionNode(tree, nodeId));
+
+  showToast('Deleted');
+  await renderCollectionSection();
+}
+
+/**
+ * collectTabIntoCollection(tabId, chipEl)
+ *
+ * Files an open tab into the collection, and deliberately leaves the tab
+ * open: collecting is filing something away for later, not clearing it out of
+ * the way. The X next to it is still how you close it.
+ *
+ * The destination is re-resolved against the freshly-read tree, exactly like
+ * addCollectedFromToolbar — the chosen group may have been deleted here or
+ * in another window since the select was last drawn.
+ */
+async function collectTabIntoCollection(tabId, chipEl) {
+  const id = Number(tabId);
+  if (!Number.isInteger(id)) return;
+
+  let tab;
+  try {
+    tab = await chrome.tabs.get(id);
+  } catch {
+    showToast('That tab is already gone');
+    await renderDashboard();
+    return;
+  }
+
+  // The label we actually displayed, same as the save-for-later path — it has
+  // already had notification counts and email addresses stripped out of it.
+  const chipText = chipEl && chipEl.querySelector ? chipEl.querySelector('.chip-text') : null;
+  const name = (chipText && chipText.textContent) || tab.title || tab.url || '';
+
+  pendingDeleteId = null;
+  noteSelfMutation();
+
+  let landedAt = '';
+  await queueCollectionWrite(tree => {
+    const wrapped = collectionWrapTopLevel(tree, collectTargetId, 'link');
+    const wanted  = wrapped.parentId;
+
+    const result = addCollectionLink(wrapped.tree, {
+      url:        tab.url,
+      name,
+      groupId:    wanted,
+      favIconUrl: tab.favIconUrl || '',
+      addedAt:    new Date().toISOString(),
+    });
+    if (!result) return tree;
+
+    landedAt = wanted ? collectionPathOf(result.tree, wanted) : '';
+    return result.tree;
+  });
+
+  showToast(landedAt ? `Collected into ${landedAt}` : 'Collected at the top level');
+  await renderCollectionSection();
+}
+
+/**
+ * openCollectionLink(nodeId)
+ *
+ * Opens a collected link in a new tab. chrome.tabs.create rather than an
+ * <a href>, because the chip has to hold its own buttons and a button nested
+ * inside an anchor is invalid markup — same reason the tab chips work this way.
+ */
+async function openCollectionLink(nodeId) {
+  const tree  = await getCollections();
+  const found = findCollectionNode(tree, nodeId);
+  if (!found) return;
+
+  const href = safeCollectionHref(found.node.url);
+  if (!href) {
+    showToast('That entry has no link to open');
+    return;
+  }
+
+  await chrome.tabs.create({ url: href });
+}
+
+/* ---- resizing a card by its right edge ---- */
+
+/**
+ * commitCollectionSpan(nodeId, span)
+ *
+ * Kept apart from the pointer handling so the part that matters — clamping,
+ * persistence — is testable without a layout engine.
+ */
+async function commitCollectionSpan(nodeId, span) {
+  noteSelfMutation();
+  await queueCollectionWrite(tree => setCollectionNodeSpan(tree, nodeId, span));
+  await renderCollectionSection();
+}
+
+function beginCollectionResize(event, handleEl) {
+  const card  = handleEl && handleEl.closest ? handleEl.closest('.collection-card') : null;
+  const board = card && card.parentElement;
+  if (!card || !board) return;
+
+  const cardRect  = card.getBoundingClientRect();
+  const boardRect = board.getBoundingClientRect();
+  const columns   = collectionColumnCount();
+  const gap       = COLLECTION_BOARD_GAP;
+
+  const span = normalizeCollectionSpan(card.dataset.span);
+  collectionResize = {
+    el: card,
+    nodeId: String(card.dataset.nodeId),
+    originalSpan: span,
+    span,
+    startX: Number(event.clientX) || 0,
+    startWidth: cardRect.width,
+    // The width one column occupies, gaps taken out
+    colUnit: (boardRect.width - gap * (columns - 1)) / columns,
+    gap,
+    columns,
+  };
+
+  if (event.pointerId !== undefined && handleEl.setPointerCapture) {
+    try { handleEl.setPointerCapture(event.pointerId); } catch {}
+  }
+}
+
+function updateCollectionResize(event) {
+  const gesture = collectionResize;
+  if (!gesture) return;
+
+  const span = collectionSpanFromDrag(
+    gesture.startWidth,
+    (Number(event.clientX) || 0) - gesture.startX,
+    gesture.colUnit, gesture.gap, gesture.columns);
+
+  if (span === gesture.span) return;
+  gesture.span = span;
+
+  // Resize the live element instead of re-rendering: a re-render would
+  // replace the very handle the pointer is captured on, ending the gesture.
+  if (gesture.el.style && typeof gesture.el.style.setProperty === 'function') {
+    gesture.el.style.setProperty('--card-span', span);
+  }
+}
+
+async function endCollectionResize() {
+  const gesture = collectionResize;
+  collectionResize = null;
+  if (!gesture) return;
+  if (gesture.span === gesture.originalSpan) return;   // never moved: no write
+  await commitCollectionSpan(gesture.nodeId, gesture.span);
+}
+
+/* ---- reordering the board ---- */
+
+/**
+ * commitCollectionMove(dragId, targetId, position)
+ *
+ * Reorders the board. Kept apart from the drag events for the same reason as
+ * the span commit: the DOM half is thin, the state half is what can be wrong.
+ *
+ * Returns whether anything actually moved.
+ */
+async function commitCollectionMove(dragId, targetId, position) {
+  if (!dragId || !targetId || dragId === targetId) return false;
+
+  noteSelfMutation();
+  let moved = false;
+
+  await queueCollectionWrite(tree => {
+    const next = moveCollectionNode(tree, dragId, targetId, position);
+    // null = refused (e.g. a cycle); same reference = a no-op worth no write
+    if (!next || next === tree) return tree;
+    moved = true;
+    return next;
+  });
+
+  if (moved) await renderCollectionSection();
+  return moved;
+}
+
+function markCollectionDropTarget(card, position) {
+  document.querySelectorAll('.collection-card.is-drop-before, .collection-card.is-drop-after').forEach(el => {
+    if (el !== card) el.classList.remove('is-drop-before', 'is-drop-after');
+  });
+
+  card.classList.toggle('is-drop-before', position === 'before');
+  card.classList.toggle('is-drop-after',  position === 'after');
+}
+
+function finishCollectionDrag() {
+  collectionDragActive = false;
+  collectionDragId = null;
+  document.querySelectorAll('.collection-card.is-drop-before, .collection-card.is-drop-after')
+    .forEach(el => el.classList.remove('is-drop-before', 'is-drop-after'));
+}
+
+/** Point new links at a particular group (the "+" on a group row). */
+async function selectCollectionTarget(id) {
+  collectTargetId = String(id || '');
+  pendingDeleteId = null;
+
+  const selectEl = document.getElementById('collectTargetSelect');
+  if (selectEl) selectEl.value = collectTargetId;
+
+  const urlEl = document.getElementById('collectUrlInput');
+  if (urlEl && typeof urlEl.focus === 'function') urlEl.focus();
+
+  const tree = await getCollections();
+  const path = collectionPathOf(tree, collectTargetId);
+  showToast(path ? `New links go to ${path}` : 'New links go to the top level');
+}
+
+
+/* ----------------------------------------------------------------
    MAIN DASHBOARD RENDERER
    ---------------------------------------------------------------- */
 
@@ -1400,9 +3559,11 @@ async function renderStaticDashboard() {
           <div class="empty-title">Couldn't read your tabs.</div>
           <div class="empty-subtitle">Reload the extension at chrome://extensions and try again.</div>
         </div>`);
-    // Saved tabs live in chrome.storage, not chrome.tabs — they're still
-    // worth showing even when the tab list can't be read.
+    // Saved tabs and collections live in chrome.storage, not chrome.tabs —
+    // they're still worth showing even when the tab list can't be read.
     await renderDeferredColumn();
+    await renderCollectionSection();
+    restoreCollectionRenameFocus();
     return;
   }
 
@@ -1438,6 +3599,10 @@ async function renderStaticDashboard() {
 
   // --- Render "Saved for Later" column ---
   await renderDeferredColumn();
+
+  // --- Render the collected-links library ---
+  await renderCollectionSection();
+  restoreCollectionRenameFocus();
 }
 
 async function renderDashboard() {
@@ -1551,6 +3716,9 @@ document.addEventListener('click', async (e) => {
 
   // ---- Close duplicate Tab Out tabs ----
   if (action === 'close-tabout-dupes') {
+    if (closeNeedsConfirmation('close-tabout-dupes',
+        'Click again to close the other Tab Out tabs', actionEl)) return;
+
     await closeTabOutDupes();
     playCloseSound();
     const banner = document.getElementById('tabOutDupeBanner');
@@ -1726,6 +3894,10 @@ document.addEventListener('click', async (e) => {
       return;
     }
 
+    if (closeNeedsConfirmation(`close-group-tabs:${groupId}`,
+        `Click again to close all ${tabs.length} tab${tabs.length !== 1 ? 's' : ''} in ${labelText}`,
+        actionEl)) return;
+
     const closed = await closeTabsByIds(tabs.map(t => t.id));
     playCloseSound();
 
@@ -1777,6 +3949,9 @@ document.addEventListener('click', async (e) => {
     const groupId = Number(actionEl.dataset.groupId);
     if (!Number.isInteger(groupId)) return;
 
+    if (closeNeedsConfirmation(`dedup-keep-one:${groupId}`,
+        'Click again to close the duplicate tabs', actionEl)) return;
+
     // Recompute duplicates from Chrome rather than trusting a payload
     // rendered earlier, and scope it to this card's group so it can't reach
     // an identical URL shown on another card.
@@ -1798,6 +3973,9 @@ document.addEventListener('click', async (e) => {
 
   // ---- Close ALL open tabs ----
   if (action === 'close-all-open-tabs') {
+    if (closeNeedsConfirmation('close-all-open-tabs',
+        'Click again to close every tab', actionEl)) return;
+
     const all    = await chrome.tabs.query({});
     const closed = await closeTabsByIds(
       all.filter(t => isRealTabUrl(t.url)).map(t => t.id)
@@ -1820,6 +3998,24 @@ document.addEventListener('click', async (e) => {
     updateFooterStats();
     return;
   }
+
+  // ---- Collected tabs ----
+  if (action === 'collect-tab')             { await collectTabIntoCollection(actionEl.dataset.tabId, actionEl.closest('.page-chip')); return; }
+  if (action === 'open-collection-link')    { await openCollectionLink(actionEl.dataset.nodeId); return; }
+  if (action === 'add-collection-link')     { await addCollectedFromToolbar();  return; }
+  if (action === 'add-collection-group')    { await addCollectedGroupFromToolbar(); return; }
+  if (action === 'add-collection-here')     { await selectCollectionTarget(actionEl.dataset.nodeId); return; }
+  if (action === 'toggle-collection-group') { await toggleCollectionGroup(actionEl.dataset.nodeId);  return; }
+  if (action === 'rename-collection-node')  { await beginCollectionRename(actionEl.dataset.nodeId);  return; }
+  if (action === 'move-collection-node')    { await beginCollectionMove(actionEl.dataset.nodeId);    return; }
+  if (action === 'copy-collection-node')    { await copyCollectionNode(actionEl.dataset.nodeId);     return; }
+  if (action === 'collect-group-tabs')      { await collectGroupIntoCollection(Number(actionEl.dataset.groupId)); return; }
+  if (action === 'cycle-collection-status') { await cycleCollectionStatus(actionEl.dataset.nodeId);  return; }
+  // The inline edit fields sit inside clickable rows. Giving them their own
+  // action is what stops a click into one being read as a click on the row
+  // underneath — which, on a link chip, would open the link.
+  if (action === 'collection-edit-field')   { return; }
+  if (action === 'delete-collection-node')  { await deleteCollectionNodeById(actionEl.dataset.nodeId); return; }
 });
 
 // ---- Archive toggle — expand/collapse the archive section ----
@@ -1832,6 +4028,214 @@ document.addEventListener('click', (e) => {
   if (body) {
     body.style.display = body.style.display === 'none' ? 'block' : 'none';
   }
+});
+
+// ---- Collected tabs: the inline rename field ----
+// The field lives inside a container that live sync rewrites wholesale, so the
+// in-progress text is held in module state instead of being read back from the
+// DOM. restoreCollectionRenameFocus() handles putting it back afterwards.
+document.addEventListener('input', async (e) => {
+  if (isCollectionRenameField(e.target)) {
+    renameDraft = e.target.value;
+    renameCaret = typeof e.target.selectionStart === 'number' ? e.target.selectionStart : null;
+    // Deliberately no render and no storage write here: re-rendering on every
+    // keystroke would cascade a full dashboard render behind each character.
+    return;
+  }
+
+  // The filter box lives in the static toolbar, so re-rendering the tree under
+  // it doesn't disturb what you're typing.
+  if (e.target.id === 'collectionFilterInput') {
+    collectionQuery = String(e.target.value || '');
+    await renderCollectionSection();
+  }
+});
+
+// The chosen destination lives in module state, not just in the select: every
+// render re-applies it, so without this the user's pick would be wiped by the
+// next live-sync re-render.
+document.addEventListener('change', async (e) => {
+  if (e.target.id === 'collectTargetSelect') {
+    collectTargetId = String(e.target.value || '');
+    return;
+  }
+
+  if (e.target.id === 'collectKindSelect') {
+    syncCollectionToolbar();
+    return;
+  }
+
+  if (e.target.id === 'collectionStatusFilter') {
+    collectionStatusFilter = normalizeCollectionStatus(e.target.value);
+    await renderCollectionSection();
+    return;
+  }
+
+  // The "move to" select commits on choosing — there is nothing half-typed
+  if (isCollectionMoveField(e.target)) {
+    await commitCollectionReparent(
+      e.target.id.slice(COLLECTION_MOVE_PREFIX.length),
+      String(e.target.value || ''));
+  }
+});
+
+// async, and it awaits the commit: the commit writes to storage and re-renders,
+// and returning its promise is what lets a caller (or a test) know when that
+// has actually landed rather than racing it.
+document.addEventListener('keydown', async (e) => {
+  // Both inline editors: Escape closes either, Enter only means something in
+  // the text field (a select commits on choosing).
+  if (isCollectionRenameField(e.target) || isCollectionMoveField(e.target)) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      cancelCollectionRename();
+      return;
+    }
+    if (e.key === 'Enter' && isCollectionRenameField(e.target)) {
+      e.preventDefault();
+      await commitCollectionRename();
+    }
+    return;
+  }
+
+  // Enter in either toolbar field adds the link, so filing several in a row
+  // never needs the mouse
+  if (e.key === 'Enter' && e.target.id !== 'collectTargetSelect' && e.target.id !== 'collectKindSelect' &&
+      (e.target.id === 'collectUrlInput' || e.target.id === 'collectNameInput' || e.target.id === 'collectLanguageInput')) {
+    e.preventDefault();
+    await addCollectedFromToolbar();
+  }
+});
+
+document.addEventListener('focusout', async (e) => {
+  // Leaving the "move to" select without choosing just closes it
+  if (isCollectionMoveField(e.target)) {
+    if (String(e.target.id) === `${COLLECTION_MOVE_PREFIX}${editingCollectionNodeId}`) {
+      cancelCollectionRename();
+    }
+    return;
+  }
+
+  if (!isCollectionRenameField(e.target)) return;
+  if (editingCollectionMode !== 'rename') return;
+
+  // focusout bubbles, which is why this isn't blur. The session token makes
+  // the focusout caused by our own re-render a no-op — without it, committing
+  // a rename would immediately commit again against the replacement field.
+  if (String(e.target.dataset.renameSession) !== String(renameSession)) return;
+
+  await commitCollectionRename();
+});
+
+/* ---- Collected tabs: dragging a card's right edge to resize it ---- */
+document.addEventListener('pointerdown', (e) => {
+  const handle = e.target.closest && e.target.closest('[data-action="resize-collection-card"]');
+  if (!handle) return;
+
+  e.preventDefault();
+  beginCollectionResize(e, handle);
+});
+
+document.addEventListener('pointermove', (e) => {
+  if (collectionResize) updateCollectionResize(e);
+});
+
+document.addEventListener('pointerup', async () => {
+  if (collectionResize) await endCollectionResize();
+});
+
+// How many columns fit depends on the window width, so a resize can leave a
+// card's stored span wider than the grid now has. Re-render to re-clamp it.
+if (typeof window !== 'undefined' && window && window.addEventListener) {
+  let boardRelayoutTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(boardRelayoutTimer);
+    boardRelayoutTimer = setTimeout(() => renderCollectionSection(), 150);
+  });
+}
+
+// Web fonts can land after the first render and change text metrics, which
+// changes card heights — so measure again once they're in.
+if (typeof document !== 'undefined' && document.fonts && document.fonts.ready &&
+    typeof document.fonts.ready.then === 'function') {
+  document.fonts.ready.then(() => layoutCollectionBoard()).catch(() => {});
+}
+
+/* ---- Collected tabs: dragging a card to reorder the board ---- */
+document.addEventListener('dragstart', (e) => {
+  const card = e.target.closest && e.target.closest('.collection-card[data-depth="0"]');
+  if (!card) return;
+
+  collectionDragId = String(card.dataset.nodeId);
+  collectionDragActive = true;
+
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move';
+    // Chrome won't start a drag unless some data is set, but the id is never
+    // read back from here: getData() returns '' during dragover by design, so
+    // the dragged id lives in module state instead.
+    e.dataTransfer.setData('text/plain', collectionDragId);
+  }
+});
+
+document.addEventListener('dragover', (e) => {
+  if (!collectionDragActive) return;
+
+  const card = e.target.closest && e.target.closest('.collection-card[data-depth="0"]');
+  if (!card || String(card.dataset.nodeId) === collectionDragId) return;
+
+  e.preventDefault();                 // this is what makes the drop possible
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+
+  markCollectionDropTarget(card, collectionDropZoneX(card.getBoundingClientRect(), e.clientX));
+});
+
+document.addEventListener('drop', async (e) => {
+  if (!collectionDragActive) return;
+
+  const card     = e.target.closest && e.target.closest('.collection-card[data-depth="0"]');
+  const dragId   = collectionDragId;
+  const position = card
+    ? collectionDropZoneX(card.getBoundingClientRect(), e.clientX)
+    : 'after';
+
+  // Clear the indicators before the (async) move, whatever happens next
+  finishCollectionDrag();
+  if (!card) return;
+
+  e.preventDefault();
+  await commitCollectionMove(dragId, String(card.dataset.nodeId), position);
+});
+
+document.addEventListener('dragend', () => finishCollectionDrag());
+
+// ---- Collected tabs: pasting a rich-text hyperlink ----
+// Copying a link out of a document or a chat gives the clipboard two flavours,
+// and the plain-text one has usually lost the address. Reading the HTML one
+// back is the only way to recover what the words were pointing at.
+document.addEventListener('paste', (e) => {
+  const target = e.target;
+  if (!target || target.id !== 'collectUrlInput') return;
+
+  const kindEl = document.getElementById('collectKindSelect');
+  const kind   = kindEl && kindEl.value ? String(kindEl.value) : 'link';
+  if (kind !== 'link') return;         // a note or a snippet wants the raw text
+
+  // Only hijack an empty field. Paste normally otherwise — replacing what
+  // someone has already typed would be a surprise.
+  if (String(target.value || '').trim()) return;
+  if (!e.clipboardData || typeof e.clipboardData.getData !== 'function') return;
+
+  const link = extractFirstHyperlink(e.clipboardData.getData('text/html'));
+  if (!link) return;                   // no anchor in there; an ordinary paste
+
+  e.preventDefault();
+  target.value = link.url;
+
+  const nameEl = document.getElementById('collectNameInput');
+  if (nameEl && !String(nameEl.value || '').trim() && link.text) nameEl.value = link.text;
+
+  showToast('Took the link out of that paste');
 });
 
 // ---- Archive search — filter archived items as user types ----
@@ -1859,16 +4263,21 @@ document.addEventListener('input', async (e) => {
 // capture-phase. An inline onerror attribute can't do this job: MV3's default
 // extension CSP blocks inline event handlers, so the ones this replaced never
 // ran at all.
+// Every element that renders a favicon, and the class that sizes its fallback.
+// A new one added here without extending this list renders failed icons as a
+// browser broken-image glyph instead of the letter avatar.
+const FAVICON_CLASSES = ['chip-favicon', 'deferred-favicon', 'collection-favicon'];
+
 document.addEventListener('error', (e) => {
   const img = e.target;
   if (!(img instanceof HTMLImageElement)) return;
 
-  const isChip = img.classList.contains('chip-favicon');
-  if (!isChip && !img.classList.contains('deferred-favicon')) return;
+  const faviconClass = FAVICON_CLASSES.find(cls => img.classList.contains(cls));
+  if (!faviconClass) return;
 
   const host   = (img.getAttribute('data-host') || '').replace(/^www\./, '');
   const avatar = document.createElement('span');
-  avatar.className = `${isChip ? 'chip-favicon' : 'deferred-favicon'} favicon-fallback`;
+  avatar.className = `${faviconClass} favicon-fallback`;
   avatar.setAttribute('aria-hidden', 'true');
   avatar.textContent = (host.charAt(0) || '?').toUpperCase();
 
@@ -1910,10 +4319,16 @@ if (chrome.tabGroups) {
   chrome.tabGroups.onMoved.addListener(scheduleSync);
 }
 
-// Saved-for-later changes — including ones made by another Tab Out tab
+// Saved-for-later and collection changes — including ones made by another
+// Tab Out tab, which is the whole point of listening at all
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && changes.deferred) scheduleSync();
+  if (area !== 'local') return;
+  if (changes.deferred || changes.collections) scheduleSync();
 });
+
+// The toolbar is static markup that no render rewrites, so its kind-dependent
+// bits have to be applied once at load as well as on every change.
+syncCollectionToolbar();
 
 renderDashboard().catch(err => {
   console.error('[tab-out] Dashboard failed to render:', err);

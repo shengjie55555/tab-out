@@ -18,22 +18,46 @@ const fs   = require('fs');
 const path = require('path');
 const vm   = require('vm');
 
-const { GROUPS, TABS, SAVED } = require('./fixtures');
+const { GROUPS, TABS, SAVED, COLLECTIONS } = require('./fixtures');
 
 const APP_PATH = path.join(__dirname, '..', 'extension', 'app.js');
 
-function makeEl(id) {
+/** Deep copy, so a stub can never leak a mutation into the fixtures */
+function clone(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function makeEl(id, styleLog) {
   const el = {
     id,
     innerHTML: '',
     textContent: '',
     className: '',
     title: '',
-    style: {},
+    value: '',
+    // Enough of CSSStyleDeclaration for app.js: it sets custom properties
+    // (--card-span, --row-span) via setProperty and plain ones (display) by
+    // assignment. styleLog records the former so layout passes are assertable.
+    style: {
+      setProperty(prop, value) {
+        this[prop] = value;
+        if (styleLog) styleLog.push({ id, prop, value });
+      },
+      getPropertyValue(prop) {
+        return this[prop] === undefined ? '' : String(this[prop]);
+      },
+    },
     dataset: {},
     offsetWidth: 10,
     offsetHeight: 10,
     parentElement: null,
+    // Input-ish surface, for the inline rename field
+    focused: false,
+    selectionStart: 0,
+    selectionEnd: 0,
+    focus() { this.focused = true; },
+    select() { this.selectionStart = 0; this.selectionEnd = String(this.value).length; },
+    setSelectionRange(a, b) { this.selectionStart = a; this.selectionEnd = b; },
     classList: {
       _set: new Set(),
       add(...cs) { cs.forEach(c => this._set.add(c)); },
@@ -80,11 +104,14 @@ function makeEventStub() {
  * `ready` is the promise app.js's own top-level renderDashboard() call
  * returns — await it to know the first render is done.
  */
-function loadApp({ degraded = false, noTabGroupsNamespace = false } = {}) {
+function loadApp({ degraded = false, noTabGroupsNamespace = false, globals = {} } = {}) {
   const els       = {};
   const listeners = [];
   const warnings  = [];
-  const calls     = { remove: [], tabGroupsUpdate: [], tabsUpdate: [], windowsUpdate: [] };
+  const calls     = { remove: [], tabGroupsUpdate: [], tabsUpdate: [], windowsUpdate: [], created: [], copied: [] };
+
+  // Every style.setProperty() app.js performs, so layout passes can be checked
+  const styleWrites = [];
 
   // Every full render reads the live tab list, so counting these is the
   // "a render ran" signal. It's kept separate from how often the DOM was
@@ -94,15 +121,30 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false } = {}) {
 
   const getEl = (id) => (els[id] = els[id] || makeEl(id));
 
-  // Count renders: every assignment to #openTabsMissions.innerHTML
-  let renderCount = 0;
-  const missionsEl = makeEl('openTabsMissions');
-  let missionsHtml = '';
-  Object.defineProperty(missionsEl, 'innerHTML', {
-    get() { return missionsHtml; },
-    set(v) { missionsHtml = v; renderCount++; },
-  });
-  els.openTabsMissions = missionsEl;
+  /**
+   * CounterElement(id)
+   *
+   * An element that counts how often its markup is rewritten. `getEl` creates
+   * elements lazily, so a counted container MUST be pre-registered here before
+   * app.js runs — otherwise the first write creates a plain element and the
+   * counter never moves.
+   */
+  function counterEl(id) {
+    const el = makeEl(id);
+    let html = '';
+    let writes = 0;
+    Object.defineProperty(el, 'innerHTML', {
+      get() { return html; },
+      set(v) { html = v; writes++; },
+    });
+    el.writes = () => writes;
+    els[id] = el;
+    return el;
+  }
+
+  const missionsEl    = counterEl('openTabsMissions');
+  const treeEl        = counterEl('collectedTree');
+  const targetSelEl   = counterEl('collectTargetSelect');
 
   const document = {
     hidden: false,
@@ -112,10 +154,16 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false } = {}) {
     body: { appendChild() {} },
     querySelector: () => null,
     querySelectorAll(sel) {
-      // Only the mission-card count matters to app.js; derive it from the
-      // markup the renderer actually wrote.
+      // Only the two selectors app.js relies on are understood; both counts
+      // come from the markup the renderer actually wrote.
+      if (sel.includes('collection-board')) {
+        // The real selector is a direct-child one, so only depth-0 cards count —
+        // counting every card would let a bug that lays out nested cards pass.
+        const n = (treeEl.innerHTML.match(/data-depth="0"/g) || []).length;
+        return Array.from({ length: n }, () => makeEl('collection-card', styleWrites));
+      }
       if (sel.includes('mission-card')) {
-        const n = (missionsHtml.match(/class="mission-card/g) || []).length;
+        const n = (missionsEl.innerHTML.match(/class="mission-card/g) || []).length;
         return Array.from({ length: n }, () => makeEl('card'));
       }
       return [];
@@ -173,6 +221,7 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false } = {}) {
         const tab = liveTabs.find(t => t.id === id);
         if (tab) Object.assign(tab, props);
       },
+      create: async (props) => { calls.created.push(props); return { id: 999, ...props }; },
     },
     tabGroups: {
       onCreated: events['tabGroups.onCreated'],
@@ -197,8 +246,24 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false } = {}) {
     storage: {
       onChanged: events['storage.onChanged'],
       local: {
-        get: async () => ({ deferred: SAVED.map(i => ({ ...i })) }),
-        set: async () => { events['storage.onChanged'].emit({ deferred: {} }, 'local'); },   // echo
+        // A real key→value store. It has to behave like chrome.storage.local
+        // or storage-backed features can't be tested at all: `get` must honour
+        // the key it's asked for, `set` must actually persist, and the
+        // onChanged echo must name the keys that really changed.
+        get: async (keys) => {
+          if (keys === undefined || keys === null) return clone(store);
+          const out = {};
+          for (const key of [].concat(keys)) out[key] = clone(store[key]);
+          return out;
+        },
+        set: async (obj) => {
+          const changes = {};
+          for (const [key, value] of Object.entries(obj)) {
+            changes[key] = { oldValue: clone(store[key]), newValue: clone(value) };
+            store[key] = clone(value);
+          }
+          events['storage.onChanged'].emit(changes, 'local');
+        },
       },
     },
   };
@@ -206,11 +271,19 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false } = {}) {
   // What a not-yet-reloaded extension actually sees: no namespace at all
   if (noTabGroupsNamespace) delete chrome.tabGroups;
 
+  // Seeded fresh per loadApp, so tests can't leak state into each other
+  let store = clone({ deferred: SAVED, collections: COLLECTIONS });
+
   const sandbox = {
     document, chrome, console: { ...console, warn: (...a) => warnings.push(a.join(' ')) },
     window: {}, performance, setTimeout, clearTimeout,
     requestAnimationFrame: () => {},
+    HTMLImageElement: class HTMLImageElement {},
+    navigator: { clipboard: { writeText: async (text) => { calls.copied.push(String(text)); } } },
     Date, Math, JSON, URL, Set, Map, Promise, Object, Array, String, Number, RegExp, Error,
+    // Stands in for config.local.js, which index.html loads but nothing tested
+    // could previously define
+    ...globals,
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
@@ -230,6 +303,8 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false } = {}) {
     calls.tabGroupsUpdate.length = 0;
     calls.tabsUpdate.length = 0;
     calls.windowsUpdate.length = 0;
+    calls.created.length = 0;
+    calls.copied.length = 0;
 
     const actionEl = makeEl('actionEl');
     actionEl.dataset = Object.assign({ action }, dataset);
@@ -240,6 +315,9 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false } = {}) {
 
     const clickHandler = listeners.find(l => l.type === 'click').fn;
     await clickHandler({ target: { closest: () => actionEl }, stopPropagation() {} });
+    // Exposed so tests can inspect a control the app marked in place (e.g. a
+    // button armed for a confirming second click)
+    calls.actionEl = actionEl;
     return calls;
   }
 
@@ -265,20 +343,60 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false } = {}) {
       events['tabGroups.onUpdated'].emit(Object.assign({ id }, props));
     },
     savedTabsChanged() {
-      events['storage.onChanged'].emit({ deferred: {} }, 'local');
+      events['storage.onChanged'].emit({ deferred: { newValue: clone(store.deferred) } }, 'local');
+    },
+    collectionsChanged() {
+      events['storage.onChanged'].emit({ collections: { newValue: clone(store.collections) } }, 'local');
     },
   };
 
+  /**
+   * fireEvent(type, event)
+   *
+   * Invokes every listener registered for a document event type. Used for the
+   * channels that have exactly one listener (input, keydown, focusout, the
+   * drag events). The caller builds the event object, so `target`, `key`,
+   * `clientY` and friends are set explicitly per test.
+   *
+   * Unlike fire(), this makes no assumption about which listener it should
+   * reach, so it's safe to add more document listeners later.
+   */
+  async function fireEvent(type, event = {}) {
+    const handled = listeners.filter(l => l.type === type);
+    for (const { fn } of handled) {
+      // Real events carry these; the app calls preventDefault() on Enter and
+      // Escape. A bare object would make that throw.
+      await fn(Object.assign({
+        target: makeEl('target'),
+        preventDefault() {},
+        stopPropagation() {},
+      }, event));
+    }
+    return handled.length;
+  }
+
   /** The dashboard's current markup, as last written */
-  function html() { return missionsHtml; }
+  function html() { return missionsEl.innerHTML; }
 
   /** How many times the card grid's markup was actually rewritten (a reflow) */
-  function gridWrites() { return renderCount; }
+  function gridWrites() { return missionsEl.writes(); }
+
+  /** How many times the collection tree was rewritten */
+  function treeWrites() { return treeEl.writes(); }
+
+  /** How many times the collection target <select>'s options were rewritten */
+  function selectWrites() { return targetSelEl.writes(); }
 
   /** How many full renders ran */
   function renders() { return tabQueries; }
 
-  return { els, calls, warnings, events, fire, simulate, html, gridWrites, renders, makeEl, ready };
+  /** A deep copy of what's actually persisted — assert on this, not on markup */
+  function storage() { return clone(store); }
+
+  return {
+    els, calls, warnings, events, fire, fireEvent, simulate, sandbox, styleWrites,
+    html, gridWrites, treeWrites, selectWrites, renders, storage, makeEl, ready,
+  };
 }
 
 module.exports = { loadApp, makeEl };
