@@ -50,8 +50,13 @@ The agent will walk you through it. Takes about 1 minute.
 - **Bring your own prefixes** — map a path prefix onto a base URL and bare paths like `team/project/run-3` become real links
 - **Duplicates are allowed, but never silent** — adding something already in the library says where it already lives
 
+### A note on Chrome's bookmarks bar
+
+Tab Out can't draw Chrome's own bookmarks bar. Extensions cannot render browser UI, and no API exposes it. Chrome's **Only on new tab page** setting doesn't help either — that checks for a `chrome://newtab` URL, and this page's URL is `chrome-extension://…`, so Chrome doesn't count it as a new tab page. If you want the bar visible here, set Chrome's bookmarks bar to **Always**.
+
 ### Both
 
+- **Light, dark, or whatever your system says** — the switch is in the header, and the choice is applied before the page paints, so a dark-mode new tab never flashes light first
 - **Your data stays local** — titles and icons come straight from Chrome, never from a third party
 - **Pure Chrome extension** — no server, no build step, nothing to install beyond loading the extension
 

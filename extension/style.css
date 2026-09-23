@@ -31,6 +31,77 @@
   --group-purple: #7a6b9a;
   --group-cyan:   #5a8a8a;
   --group-orange: #c8713a;   /* = --accent-amber */
+
+  /* Component triples for every translucent overlay in this file. Overlays are
+     written as rgb(var(--rgb-x) / a), so changing the hue here carries every
+     hover tint, hairline and accent wash with it — which is what makes a
+     second theme possible at all. */
+  --rgb-ink:    26 22 19;
+  --rgb-muted:  154 145 138;
+  --rgb-amber:  200 113 58;
+  --rgb-sage:   90 122 98;
+  --rgb-slate:  90 107 122;
+  --rgb-rose:   179 90 90;
+  --rgb-green:  61 122 74;
+  --rgb-yellow: 184 137 46;
+
+  color-scheme: light;
+}
+
+/* ================================================================
+   DARK
+
+   The same warm family with the lights down: paper becomes a warm near-black,
+   ink a warm off-white, so it still reads as this product rather than a
+   different one with the colours inverted.
+
+   Three modes resolve to this one attribute — theme.js picks light or dark
+   before the page paints (following the system when that's the preference) and
+   keeps it in step when the system changes, so the stylesheet only ever sees
+   two states and never has to know what "system" means.
+   ================================================================ */
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --paper:     #1b1917;
+  --card-bg:   #242120;
+  --warm-gray: #3a3532;
+  --ink:       #e9e3da;
+  --muted:     #8f8780;
+  --ink-soft:  #b5ada4;
+
+  /* A shadow needs much more weight to read against a dark ground */
+  --shadow: rgba(0, 0, 0, 0.5);
+
+  /* Accents lightened so they hold the contrast they had on paper: each of
+     these is 6.7:1 or better against --paper. */
+  --accent-amber: #e59a63;
+  --accent-sage:  #93b79d;
+  --accent-slate: #9ab0c4;
+  --accent-rose:  #d98c8c;
+
+  --status-active:    #7fb389;
+  --status-cooling:   #d9ab5c;
+  --status-abandoned: #cf8080;
+
+  --rgb-ink:    233 227 218;
+  --rgb-muted:  143 135 128;
+  --rgb-amber:  229 154 99;
+  --rgb-sage:   147 183 157;
+  --rgb-slate:  154 176 196;
+  --rgb-rose:   217 140 140;
+  --rgb-green:  127 179 137;
+  --rgb-yellow: 217 171 92;
+
+  --group-grey:   #8f8780;
+  --group-blue:   #7f97ab;
+  --group-red:    #cf8080;
+  --group-yellow: #d9ab5c;
+  --group-green:  #85a98f;
+  --group-pink:   #cf9aa9;
+  --group-purple: #a396c4;
+  --group-cyan:   #82b3b3;
+  --group-orange: #dd9463;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -94,10 +165,53 @@ header {
   text-transform: uppercase;
 }
 
+/* ---- Theme switch ---- */
+.theme-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--warm-gray);
+  border-radius: 8px;
+  background: var(--card-bg);
+  flex-shrink: 0;
+}
+
+.theme-option {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+  color: var(--muted);
+  transition: color 0.15s, background 0.15s;
+}
+
+.theme-option svg {
+  width: 14px;
+  height: 14px;
+}
+
+.theme-option:hover {
+  color: var(--ink);
+}
+
+/* aria-pressed, not a class: the buttons report the chosen MODE, and the
+   attribute is what the markup already uses to be accessible. */
+.theme-option[aria-pressed="true"] {
+  color: var(--ink);
+  background: rgb(var(--rgb-ink) / 0.07);
+}
+
 /* ---- Tab cleanup banner ---- */
 .tab-cleanup-banner {
-  background: linear-gradient(135deg, rgba(200, 113, 58, 0.04), rgba(200, 113, 58, 0.09));
-  border: 1px solid rgba(200, 113, 58, 0.18);
+  background: linear-gradient(135deg, rgb(var(--rgb-amber) / 0.04), rgb(var(--rgb-amber) / 0.09));
+  border: 1px solid rgb(var(--rgb-amber) / 0.18);
   border-radius: 8px;
   padding: 16px 24px;
   display: flex;
@@ -116,7 +230,7 @@ header {
   width: 36px;
   height: 36px;
   border-radius: 50%;
-  background: rgba(200, 113, 58, 0.1);
+  background: rgb(var(--rgb-amber) / 0.1);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -160,8 +274,8 @@ header {
 
 /* ---- Nudge banner ---- */
 .nudge-banner {
-  background: linear-gradient(135deg, rgba(179, 90, 90, 0.04), rgba(179, 90, 90, 0.08));
-  border: 1px solid rgba(179, 90, 90, 0.15);
+  background: linear-gradient(135deg, rgb(var(--rgb-rose) / 0.04), rgb(var(--rgb-rose) / 0.08));
+  border: 1px solid rgb(var(--rgb-rose) / 0.15);
   border-radius: 8px;
   padding: 16px 24px;
   display: flex;
@@ -174,7 +288,7 @@ header {
   width: 36px;
   height: 36px;
   border-radius: 50%;
-  background: rgba(179, 90, 90, 0.1);
+  background: rgb(var(--rgb-rose) / 0.1);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -332,7 +446,7 @@ header {
 
 .card-collapse-toggle:hover {
   color: var(--ink);
-  background: rgba(26, 22, 19, 0.05);
+  background: rgb(var(--rgb-ink) / 0.05);
 }
 
 .mission-card.is-collapsed .card-collapse-toggle svg {
@@ -357,17 +471,17 @@ header {
 
 .mission-tag.active {
   color: var(--status-active);
-  background: rgba(61, 122, 74, 0.08);
+  background: rgb(var(--rgb-green) / 0.08);
 }
 
 .mission-tag.cooling {
   color: var(--status-cooling);
-  background: rgba(184, 137, 46, 0.08);
+  background: rgb(var(--rgb-yellow) / 0.08);
 }
 
 .mission-tag.abandoned {
   color: var(--status-abandoned);
-  background: rgba(179, 90, 90, 0.08);
+  background: rgb(var(--rgb-rose) / 0.08);
 }
 
 /* Tab indicator badge — shows how many Chrome tabs are still open for this mission */
@@ -378,10 +492,12 @@ header {
   font-size: 10px;
   font-weight: 500;
   color: var(--accent-amber);
-  background: rgba(200, 113, 58, 0.08);
+  background: rgb(var(--rgb-amber) / 0.08);
   padding: 2px 8px;
   border-radius: 3px;
 }
+
+/* The same badge, but flagging duplicates rather than the tab count */
 
 .open-tabs-badge svg {
   width: 10px;
@@ -409,7 +525,7 @@ header {
   padding: 8px 4px;
   border-radius: 0;
   border: none;
-  border-bottom: 1px solid rgba(154, 145, 138, 0.1);
+  border-bottom: 1px solid rgb(var(--rgb-muted) / 0.1);
   position: relative;
   display: flex;
   align-items: center;
@@ -438,7 +554,7 @@ header {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: rgba(154, 145, 138, 0.16);
+  background: rgb(var(--rgb-muted) / 0.16);
   color: var(--muted);
   font-size: 9px;
   font-weight: 600;
@@ -476,7 +592,7 @@ header {
 
 /* Duplicate border highlight */
 .chip-has-dupes {
-  border-color: rgba(200, 113, 58, 0.25);
+  border-color: rgb(var(--rgb-amber) / 0.25);
 }
 
 /* Action buttons grouped on the right */
@@ -511,7 +627,7 @@ header {
 
 .chip-action:hover {
   opacity: 1;
-  background: rgba(154, 145, 138, 0.1);
+  background: rgb(var(--rgb-muted) / 0.1);
 }
 
 .chip-collect:hover {
@@ -520,12 +636,12 @@ header {
 
 .chip-save:hover {
   color: var(--accent-sage);
-  background: rgba(90, 122, 98, 0.08);
+  background: rgb(var(--rgb-sage) / 0.08);
 }
 
 .chip-close:hover {
   color: var(--status-abandoned);
-  background: rgba(179, 90, 90, 0.08);
+  background: rgb(var(--rgb-rose) / 0.08);
 }
 
 .page-chip.clickable {
@@ -534,7 +650,7 @@ header {
 }
 
 .page-chip.clickable:hover {
-  background: rgba(200, 113, 58, 0.04);
+  background: rgb(var(--rgb-amber) / 0.04);
 }
 
 /* "+N more" overflow chip */
@@ -594,24 +710,24 @@ header {
 }
 
 .action-btn.close-tabs {
-  border-color: rgba(200, 113, 58, 0.3);
+  border-color: rgb(var(--rgb-amber) / 0.3);
   color: var(--accent-amber);
-  background: rgba(200, 113, 58, 0.04);
+  background: rgb(var(--rgb-amber) / 0.04);
 }
 
 .action-btn.close-tabs:hover {
-  background: rgba(200, 113, 58, 0.1);
+  background: rgb(var(--rgb-amber) / 0.1);
   border-color: var(--accent-amber);
 }
 
 .action-btn.save-tabs {
-  border-color: rgba(90, 122, 98, 0.3);
+  border-color: rgb(var(--rgb-sage) / 0.3);
   color: var(--accent-sage);
-  background: rgba(90, 122, 98, 0.04);
+  background: rgb(var(--rgb-sage) / 0.04);
 }
 
 .action-btn.save-tabs:hover {
-  background: rgba(90, 122, 98, 0.1);
+  background: rgb(var(--rgb-sage) / 0.1);
   border-color: var(--accent-sage);
 }
 
@@ -746,7 +862,7 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
 /* ---- "Domain" tag on static domain cards ---- */
 .mission-tag.neutral {
   color: var(--muted);
-  background: rgba(154, 145, 138, 0.1);
+  background: rgb(var(--rgb-muted) / 0.1);
 }
 
 /* ================================================================
@@ -776,12 +892,12 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   width: 56px;
   height: 56px;
   border-radius: 50%;
-  background: rgba(90, 122, 98, 0.1);
-  border: 1.5px solid rgba(90, 122, 98, 0.3);
+  background: rgb(var(--rgb-sage) / 0.1);
+  border: 1.5px solid rgb(var(--rgb-sage) / 0.3);
 
   /* Soft sage glow */
-  box-shadow: 0 0 0 8px rgba(90, 122, 98, 0.05),
-              0 0 0 16px rgba(90, 122, 98, 0.03);
+  box-shadow: 0 0 0 8px rgb(var(--rgb-sage) / 0.05),
+              0 0 0 16px rgb(var(--rgb-sage) / 0.03);
 
   display: flex;
   align-items: center;
@@ -836,8 +952,8 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   gap: 12px;
 
   /* Sage green tint — matches accent-sage but very light */
-  background: linear-gradient(135deg, rgba(90, 122, 98, 0.05), rgba(90, 122, 98, 0.10));
-  border: 1px solid rgba(90, 122, 98, 0.22);
+  background: linear-gradient(135deg, rgb(var(--rgb-sage) / 0.05), rgb(var(--rgb-sage) / 0.10));
+  border: 1px solid rgb(var(--rgb-sage) / 0.22);
   border-radius: 8px;
   padding: 10px 16px;
 
@@ -929,7 +1045,7 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
 }
 
 .update-banner-dismiss:hover {
-  background: rgba(26, 22, 19, 0.06);
+  background: rgb(var(--rgb-ink) / 0.06);
   color: var(--ink);
 }
 
@@ -983,7 +1099,7 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   align-items: flex-start;
   gap: 10px;
   padding: 10px 0;
-  border-bottom: 1px solid rgba(154, 145, 138, 0.12);
+  border-bottom: 1px solid rgb(var(--rgb-muted) / 0.12);
   animation: fadeUp 0.3s ease both;
 }
 
@@ -1189,7 +1305,7 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   align-items: center;
   gap: 8px;
   padding: 6px 0;
-  border-bottom: 1px solid rgba(154, 145, 138, 0.08);
+  border-bottom: 1px solid rgb(var(--rgb-muted) / 0.08);
 }
 
 .archive-item:last-child {
@@ -1279,7 +1395,7 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
 .collection-ctl:focus {
   outline: none;
   border-color: var(--accent-slate);
-  box-shadow: 0 0 0 2px rgba(90, 107, 122, 0.15);
+  box-shadow: 0 0 0 2px rgb(var(--rgb-slate) / 0.15);
 }
 
 .collection-kind {
@@ -1405,7 +1521,7 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   width: 9px;
   cursor: col-resize;
   opacity: 0;
-  background: linear-gradient(to right, transparent, rgba(26, 22, 19, 0.05));
+  background: linear-gradient(to right, transparent, rgb(var(--rgb-ink) / 0.05));
   transition: opacity 0.15s;
 }
 
@@ -1517,12 +1633,12 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
 
 .collection-action:hover {
   color: var(--ink);
-  background: rgba(26, 22, 19, 0.06);
+  background: rgb(var(--rgb-ink) / 0.06);
 }
 
 .collection-action.is-danger:hover {
   color: var(--accent-rose);
-  background: rgba(179, 90, 90, 0.1);
+  background: rgb(var(--rgb-rose) / 0.1);
 }
 
 /* ---- chips ----
@@ -1537,7 +1653,7 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
    the card says so before the second click lands. */
 .collection-card.is-confirming,
 .page-chip.is-confirming {
-  box-shadow: 0 0 0 1px rgba(179, 90, 90, 0.4);
+  box-shadow: 0 0 0 1px rgb(var(--rgb-rose) / 0.4);
 }
 
 .collection-card.is-confirming .collection-action.is-danger,
@@ -1580,7 +1696,7 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
 
 .collection-rename:focus {
   outline: none;
-  box-shadow: 0 0 0 2px rgba(90, 107, 122, 0.15);
+  box-shadow: 0 0 0 2px rgb(var(--rgb-slate) / 0.15);
 }
 
 /* The "move to" select borrows the rename field's slot and metrics */
@@ -1661,7 +1777,7 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   font-size: 11.5px;
   line-height: 1.45;
   color: var(--ink);
-  background: rgba(26, 22, 19, 0.04);
+  background: rgb(var(--rgb-ink) / 0.04);
   border-radius: 4px;
   padding: 4px 6px;
   margin: 0;
@@ -1701,8 +1817,8 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
    with it. Closing a single tab is deliberately not gated this way. */
 .action-btn.is-confirming {
   color: var(--accent-rose);
-  border-color: rgba(179, 90, 90, 0.5);
-  background: rgba(179, 90, 90, 0.08);
+  border-color: rgb(var(--rgb-rose) / 0.5);
+  background: rgb(var(--rgb-rose) / 0.08);
 }
 
 .tab-cleanup-btn.is-confirming {
@@ -1715,8 +1831,8 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
 
 .action-btn.collect-group:hover {
   color: var(--accent-sage);
-  border-color: rgba(90, 122, 98, 0.4);
-  background: rgba(90, 122, 98, 0.07);
+  border-color: rgb(var(--rgb-sage) / 0.4);
+  background: rgb(var(--rgb-sage) / 0.07);
 }
 
 .action-btn.collect-group svg {

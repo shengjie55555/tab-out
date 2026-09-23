@@ -1370,17 +1370,27 @@ function playCloseSound() {
  * coordinates (typically the center of a card being closed).
  * Pure CSS + JS, no libraries.
  */
+/**
+ * Two hand-picked palettes rather than one derived from the tokens: half of
+ * the light set — sage, slate, rose — is dark enough to disappear against a
+ * dark page, so the dark set substitutes lighter versions rather than reusing
+ * them at a different alpha.
+ */
+const CONFETTI_PALETTE = {
+  light: ['#c8713a', '#e8a070', '#5a7a62', '#8aaa92', '#5a6b7a', '#8a9baa', '#d4b896', '#b35a5a'],
+  dark:  ['#e59a63', '#f0b98a', '#93b79d', '#bcd9c4', '#9ab0c4', '#b8cadb', '#e9e3da', '#d98c8c'],
+};
+
+function currentConfettiPalette() {
+  const theme = (document.documentElement && document.documentElement.dataset)
+    ? document.documentElement.dataset.theme
+    : 'light';
+
+  return CONFETTI_PALETTE[theme] || CONFETTI_PALETTE.light;
+}
+
 function shootConfetti(x, y) {
-  const colors = [
-    '#c8713a', // amber
-    '#e8a070', // amber light
-    '#5a7a62', // sage
-    '#8aaa92', // sage light
-    '#5a6b7a', // slate
-    '#8a9baa', // slate light
-    '#d4b896', // warm paper
-    '#b35a5a', // rose
-  ];
+  const colors = currentConfettiPalette();
 
   const particleCount = 17;
 
@@ -2060,7 +2070,10 @@ function renderGroupCard(group) {
   </span>`;
 
   const dupeBadge = hasDupes
-    ? `<span class="open-tabs-badge" style="color:var(--accent-amber);background:rgba(200,113,58,0.08);">
+    // The badge's own class already carries the amber colour and wash; the
+    // inline copy it used to have was redundant AND pinned to the light
+    // palette, so it stayed a dark-on-dark smudge in the dark theme.
+    ? `<span class="open-tabs-badge">
         ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}
       </span>`
     : '';
@@ -2281,6 +2294,18 @@ function renderArchiveItem(item) {
  * confidently wrong link is worse than an honest non-link.
  */
 /**
+ * isSafeHttpUrl(value)
+ *
+ * True only for http(s) — a whitelist, so javascript:, data:, vbscript: and
+ * chrome-extension: all fall out for free. A collected entry is just text
+ * somebody typed, so it can carry any scheme at all, and only one we're
+ * willing to follow is allowed to reach an href on this page.
+ */
+function isSafeHttpUrl(value) {
+  return /^https?:/i.test(String(value || '').trim());
+}
+
+/**
  * collectionLinkPrefixes()
  *
  * Personal mappings from a bare path prefix onto a base URL, read from
@@ -2305,7 +2330,7 @@ function collectionLinkPrefixes() {
 
 function safeCollectionHref(url) {
   const raw = String(url || '').trim();
-  if (/^https?:/i.test(raw)) return raw;
+  if (isSafeHttpUrl(raw)) return raw;
 
   for (const [prefix, base] of collectionLinkPrefixes()) {
     if (!raw.startsWith(prefix)) continue;
@@ -3700,6 +3725,106 @@ document.addEventListener('visibilitychange', () => {
 
 
 /* ----------------------------------------------------------------
+   THEME — light, dark, or whatever the system says
+
+   The preference lives in localStorage rather than chrome.storage.local,
+   because theme.js has to read it synchronously before the first paint:
+   chrome.storage is async, and a new tab page created constantly can't afford
+   to flash the wrong theme every time. This file owns it from first paint on;
+   theme.js only had to get that first frame right.
+   ---------------------------------------------------------------- */
+
+const THEME_STORAGE_KEY = 'tab-out-theme';
+const THEME_CHOICES     = ['light', 'system', 'dark'];
+const THEME_BUTTON_IDS  = [['themeLight', 'light'], ['themeSystem', 'system'], ['themeDark', 'dark']];
+
+function normalizeThemeChoice(value) {
+  return THEME_CHOICES.includes(value) ? value : 'system';
+}
+
+function systemPrefersDark() {
+  try {
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * resolveThemeChoice(choice)
+ *
+ * The concrete light/dark the stylesheet gets — it never hears about "system",
+ * which is what keeps the dark tokens defined in exactly one place.
+ */
+function resolveThemeChoice(choice) {
+  if (choice === 'dark')  return 'dark';
+  if (choice === 'light') return 'light';
+  return systemPrefersDark() ? 'dark' : 'light';
+}
+
+function applyThemeChoice(choice) {
+  const wanted   = normalizeThemeChoice(choice);
+  const resolved = resolveThemeChoice(wanted);
+
+  if (document.documentElement && document.documentElement.dataset) {
+    document.documentElement.dataset.theme = resolved;
+  }
+
+  // The buttons report which CHOICE is active, not which colour happens to be
+  // showing: "following the system" and "set to dark, and so is the system"
+  // are different states and should look different.
+  for (const [id, value] of THEME_BUTTON_IDS) {
+    const button = document.getElementById(id);
+    if (button && button.setAttribute) {
+      button.setAttribute('aria-pressed', String(value === wanted));
+    }
+  }
+
+  return resolved;
+}
+
+function readThemeChoice() {
+  try {
+    return normalizeThemeChoice(localStorage.getItem(THEME_STORAGE_KEY));
+  } catch {
+    return 'system';
+  }
+}
+
+function setThemeChoice(choice) {
+  const wanted = normalizeThemeChoice(choice);
+
+  applyThemeChoice(wanted);
+
+  try { localStorage.setItem(THEME_STORAGE_KEY, wanted); } catch {}
+
+  return wanted;
+}
+
+// The system preference can change while a dashboard is open. Follow it live,
+// but only while it's what the preference actually says.
+if (typeof window !== 'undefined' && window && window.matchMedia) {
+  try {
+    const query    = window.matchMedia('(prefers-color-scheme: dark)');
+    const onChange = () => {
+      if (readThemeChoice() === 'system') applyThemeChoice('system');
+    };
+
+    if (query.addEventListener)  query.addEventListener('change', onChange);
+    else if (query.addListener)  query.addListener(onChange);   // older Chrome
+  } catch {}
+}
+
+// A theme changed in another Tab Out page should carry over to this one
+if (typeof window !== 'undefined' && window && window.addEventListener) {
+  window.addEventListener('storage', (e) => {
+    if (!e || e.key !== THEME_STORAGE_KEY) return;
+    applyThemeChoice(normalizeThemeChoice(e.newValue));
+  });
+}
+
+
+/* ----------------------------------------------------------------
    EVENT HANDLERS — using event delegation
 
    One listener on document handles ALL button clicks.
@@ -3713,6 +3838,12 @@ document.addEventListener('click', async (e) => {
   if (!actionEl) return;
 
   const action = actionEl.dataset.action;
+
+  // ---- Theme ----
+  if (action === 'set-theme') {
+    setThemeChoice(actionEl.dataset.themeChoice);
+    return;
+  }
 
   // ---- Close duplicate Tab Out tabs ----
   if (action === 'close-tabout-dupes') {
@@ -4329,6 +4460,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // The toolbar is static markup that no render rewrites, so its kind-dependent
 // bits have to be applied once at load as well as on every change.
 syncCollectionToolbar();
+
+// theme.js already set the attribute before the first paint; this syncs the
+// three buttons to the stored choice.
+applyThemeChoice(readThemeChoice());
 
 renderDashboard().catch(err => {
   console.error('[tab-out] Dashboard failed to render:', err);

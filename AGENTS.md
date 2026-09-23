@@ -20,6 +20,7 @@ Before doing anything technical, tell the user what they're about to get:
 > - **Duplicate detection** flags when you have the same page open twice
 > - **Click any tab title to jump to it** even across different Chrome windows
 > - **Save for later** bookmark individual tabs to a checklist before closing them
+> - **Light, dark, or follow the system** — the switch sits in the header, and your choice sticks
 > - **Your tab data stays local** no server, no accounts; titles and icons come straight from Chrome
 >
 > It's just a Chrome extension. Setup takes about 1 minute.
@@ -91,10 +92,10 @@ Once the extension is loaded:
 >
 > Then scroll down to **Collected tabs**, the library:
 >
-> 10. **Add anything** from the bar at the top: a link, a note, or a code snippet. Pasting several lines makes one entry per line, all in one new group.
-> 11. **Everything added at the top level gets its own group** — Link1, Note1, Code1 and so on — so the board stays a board of cards.
-> 12. **Drag a card** to reorder it, or drag its right **edge** to make it wider; widths snap to the grid so the columns stay lined up.
-> 13. **Move an entry anywhere** with the arrow icon, filter by text or status on the right, and tag an entry to-do / doing / done / dropped with the dot on its row.
+> 1. **Add anything** from the bar at the top: a link, a note, or a code snippet. Pasting several lines makes one entry per line, all in one new group.
+> 2. **Everything added at the top level gets its own group** — Link1, Note1, Code1 and so on — so the board stays a board of cards.
+> 3. **Drag a card** to reorder it, or drag its right **edge** to make it wider; widths snap to the grid so the columns stay lined up.
+> 4. **Move an entry anywhere** with the arrow icon, filter by text or status on the right, and tag an entry to-do / doing / done / dropped with the dot on its row.
 >
 > That's it! No server to run. Everything works right away.
 
@@ -103,7 +104,7 @@ Once the extension is loaded:
 ## Key Facts
 
 - Tab Out is a pure Chrome extension. No server, no build step, no dependencies to install.
-- `npm test` (plain Node, no install needed) runs the dashboard's grouping and tab-closing tests.
+- `npm test` (plain Node, no install needed) runs the tests for the grouping, the tab-closing rules, the collected-tabs tree and the theme.
 - Saved tabs and the collected-tabs library are both stored in `chrome.storage.local` (they persist across sessions). The library lives under the `collections` key.
 - `extension/config.local.js` is optional and gitignored. Its one current use is `LOCAL_LINK_PREFIXES`, which maps your own path prefixes onto a base URL so bare paths become real links. Only http(s) bases are accepted.
 - Your tab data stays local: no server, no accounts, no analytics, and no third-party requests for titles or icons — they come from `chrome.tabs` / `chrome.tabGroups`. (The page does load its fonts from Google Fonts.)

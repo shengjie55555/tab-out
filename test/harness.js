@@ -146,9 +146,22 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false, globals = {} 
   const treeEl        = counterEl('collectedTree');
   const targetSelEl   = counterEl('collectTargetSelect');
 
+  // localStorage, so the theme preference round-trips; and a matchMedia stub
+  // whose answer the test can flip, standing in for the OS switching.
+  const localStore = new Map();
+  let   prefersDark = false;
+  const systemThemeListeners = [];
+
+  const localStorageStub = {
+    getItem: (key) => (localStore.has(key) ? localStore.get(key) : null),
+    setItem: (key, value) => { localStore.set(key, String(value)); },
+    removeItem: (key) => { localStore.delete(key); },
+  };
+
   const document = {
     hidden: false,
     getElementById: getEl,
+    documentElement: { dataset: {}, setAttribute() {} },
     createElement: () => makeEl('created'),
     addEventListener(type, fn) { listeners.push({ type, fn }); },
     body: { appendChild() {} },
@@ -243,6 +256,7 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false, globals = {} 
       getCurrent: async () => ({ id: 1 }),
       update:     async (id, props) => { calls.windowsUpdate.push([id, props]); },
     },
+
     storage: {
       onChanged: events['storage.onChanged'],
       local: {
@@ -276,7 +290,17 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false, globals = {} 
 
   const sandbox = {
     document, chrome, console: { ...console, warn: (...a) => warnings.push(a.join(' ')) },
-    window: {}, performance, setTimeout, clearTimeout,
+    window: {
+      matchMedia: (query) => ({
+        matches: /prefers-color-scheme:\s*dark/.test(query) ? prefersDark : false,
+        // Recorded rather than ignored, so a test can make the OS switch
+        addEventListener: (type, fn) => { if (type === 'change') systemThemeListeners.push(fn); },
+        addListener: (fn) => systemThemeListeners.push(fn),
+      }),
+      addEventListener() {},
+    },
+    localStorage: localStorageStub,
+    performance, setTimeout, clearTimeout,
     requestAnimationFrame: () => {},
     HTMLImageElement: class HTMLImageElement {},
     navigator: { clipboard: { writeText: async (text) => { calls.copied.push(String(text)); } } },
@@ -347,6 +371,11 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false, globals = {} 
     },
     collectionsChanged() {
       events['storage.onChanged'].emit({ collections: { newValue: clone(store.collections) } }, 'local');
+    },
+    /** Stands in for the OS switching between light and dark */
+    setSystemDark(value) {
+      prefersDark = !!value;
+      systemThemeListeners.forEach(fn => fn({ matches: prefersDark }));
     },
   };
 

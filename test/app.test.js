@@ -1081,6 +1081,93 @@ async function testBatchCloseConfirmation() {
 }
 
 /* ================================================================
+   0i. Theme
+   ================================================================ */
+async function testTheme() {
+  section('Theme — the three modes');
+  const app = await boot();
+  const applied = () => app.sandbox.document.documentElement.dataset.theme;
+  const stored  = () => app.sandbox.localStorage.getItem('tab-out-theme');
+  const pressed = () => ['themeLight', 'themeSystem', 'themeDark']
+    .filter(id => app.els[id] && app.els[id]['aria-pressed'] === 'true');
+
+  eq('it starts by following a light system', applied(), 'light');
+  eq('...with nothing stored yet', stored(), null);
+
+  section('Theme — choosing a mode');
+  await app.fire('set-theme', { themeChoice: 'dark' });
+  eq('dark applies immediately', applied(), 'dark');
+  eq('...and is remembered', stored(), 'dark');
+  eq('...and only that button reads as pressed', pressed(), ['themeDark']);
+
+  await app.fire('set-theme', { themeChoice: 'light' });
+  eq('light applies', applied(), 'light');
+  eq('...and is remembered', stored(), 'light');
+  eq('...and only that button reads as pressed', pressed(), ['themeLight']);
+
+  section('Theme — following the system');
+  await app.fire('set-theme', { themeChoice: 'system' });
+  eq('a light system means light', applied(), 'light');
+  eq('...but SYSTEM is the pressed button, not light',
+     pressed(), ['themeSystem']);
+
+  app.simulate.setSystemDark(true);
+  eq('an OS switch is followed', applied(), 'dark');
+  eq('...without changing which mode is chosen', pressed(), ['themeSystem']);
+
+  section('Theme — an explicit choice ignores the system');
+  await app.fire('set-theme', { themeChoice: 'light' });
+  app.simulate.setSystemDark(false);
+  app.simulate.setSystemDark(true);
+  eq('explicit light stays light while the OS goes dark', applied(), 'light');
+
+  section('Theme — the confetti follows it too');
+  await app.fire('set-theme', { themeChoice: 'dark' });
+  eq('dark gets the lighter palette', app.sandbox.currentConfettiPalette()[0], '#e59a63');
+  await app.fire('set-theme', { themeChoice: 'light' });
+  eq('light gets the original one', app.sandbox.currentConfettiPalette()[0], '#c8713a');
+  // Reached through the function, not the constant: a top-level `const` lives
+  // in the vm's lexical scope and never appears on the sandbox object.
+  await app.fire('set-theme', { themeChoice: 'light' });
+  const lightSet = app.sandbox.currentConfettiPalette();
+  await app.fire('set-theme', { themeChoice: 'dark' });
+  const darkSet = app.sandbox.currentConfettiPalette();
+  ok('...and the two share no colours',
+     lightSet.every(colour => !darkSet.includes(colour)), JSON.stringify({ lightSet, darkSet }));
+
+  section('Theme — junk falls back to following the system');
+  eq('an unknown mode reads as system', app.sandbox.normalizeThemeChoice('neon'), 'system');
+  eq('a missing one too', app.sandbox.normalizeThemeChoice(undefined), 'system');
+}
+
+async function testThemeStylesheet() {
+  section('Theme — the stylesheet carries no light-only colour');
+  const fs   = require('fs');
+  const path = require('path');
+  const css  = fs.readFileSync(path.join(__dirname, '..', 'extension', 'style.css'), 'utf8');
+
+  // Everything outside :root has to go through a hue token, or it stays pinned
+  // to the light palette no matter what theme is active. This is the guard
+  // that keeps a future edit from quietly reintroducing one.
+  const rootEnd     = css.indexOf('\n}\n', css.indexOf(':root {'));
+  const outsideRoot = css.slice(rootEnd);
+  const literals    = outsideRoot.match(/rgba\([^)]*\)/g) || [];
+  const lightOnly   = literals.filter(l => !/^rgba\(0,\s*0,\s*0/.test(l));
+
+  eq('every alpha overlay outside :root goes through a token', lightOnly, []);
+
+  const dark = css.slice(css.indexOf('[data-theme="dark"]'));
+  ok('a dark theme exists', dark.length > 0);
+  for (const token of ['--paper', '--card-bg', '--ink', '--muted', '--ink-soft',
+                       '--shadow', '--rgb-ink', '--group-blue', '--accent-amber']) {
+    ok(`...and redefines ${token}`, dark.includes(`${token}:`), token);
+  }
+
+  ok('the page declares a colour scheme for both',
+     /color-scheme: light/.test(css) && /color-scheme: dark/.test(css));
+}
+
+/* ================================================================
    1. Grouping — cards mirror Chrome's tab groups
    ================================================================ */
 async function testGrouping() {
@@ -1408,6 +1495,8 @@ const SUITES = [
   ['collections: link paste',   testCollectionHyperlinkPaste],
   ['collections: auto groups',  testCollectionAutoGroups],
   ['closing: confirmation',     testBatchCloseConfirmation],
+  ['theme',                     testTheme],
+  ['theme: stylesheet',         testThemeStylesheet],
   ['collections: filter',       testCollectionFilter],
   ['collections: whole group',  testCollectWholeGroup],
   ['grouping',                  testGrouping],
