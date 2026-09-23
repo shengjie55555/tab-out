@@ -431,7 +431,8 @@ let collectionsWriteChain = Promise.resolve();
 // tree out from under you — see the rename state machine in the handlers.
 let editingCollectionNodeId = null;   // string id, or null
 let editingCollectionMode   = 'rename'; // 'rename' (a text field) or 'move' (a select)
-let renameDraft             = '';     // what the field currently shows
+let renameDraft             = '';     // what the name field currently shows
+let bodyDraft               = '';     // ...and the body field, for a note or snippet
 let renameCaret             = null;   // selectionStart as of the last input
 let renameSession           = 0;      // bumped on every open/commit/cancel
 
@@ -1026,6 +1027,24 @@ function collectionWrapTopLevel(tree, parentId, kind) {
   if (!made) return { tree, parentId: null };
 
   return { tree: made.tree, parentId: made.id };
+}
+
+/**
+ * setCollectionNodeBody(tree, id, body)
+ *
+ * Replaces a note's text or a snippet's code. Links and groups have no body —
+ * their name is the whole of what they are — so they come back untouched.
+ */
+function setCollectionNodeBody(tree, id, body) {
+  const value = typeof body === 'string' ? body : '';
+
+  const nodes = updateCollectionNodes(tree.nodes, id, node => {
+    if (node.type === 'note')    return Object.assign({}, node, { text: value });
+    if (node.type === 'snippet') return Object.assign({}, node, { code: value });
+    return node;
+  });
+
+  return nodes ? Object.assign({}, tree, { nodes }) : null;
 }
 
 function setCollectionNodeStatus(tree, id, status) {
@@ -2585,11 +2604,22 @@ function collectionItemIcon(node) {
 
 /** Notes and snippets carry a body; a link doesn't. */
 function renderCollectionBody(node) {
+  const isCode  = node.type === 'snippet';
+  const editing = editingCollectionNodeId === String(node.id) &&
+                  editingCollectionMode === 'rename';
+
+  // For a note or a snippet the body IS the thing, so editing one has to
+  // reach the text — editing an incidental name instead, while the content
+  // sits there untouchable, is the wrong end of the entry.
+  if (editing && (node.type === 'note' || isCode)) {
+    return `<textarea class="collection-body-edit${isCode ? ' is-code' : ''}" id="collection-body-${escapeHtml(node.id)}" rows="${isCode ? 4 : 3}" spellcheck="false" aria-label="${isCode ? 'Code' : 'Note'}" data-action="collection-edit-field" draggable="false">${escapeHtml(bodyDraft)}</textarea>`;
+  }
+
   if (node.type === 'note') {
     return `<div class="collection-note">${escapeHtml(node.text)}</div>`;
   }
 
-  if (node.type === 'snippet') {
+  if (isCode) {
     const language = (node.language || '').trim();
     return `<div class="collection-snippet">${language ? `<span class="collection-lang">${escapeHtml(language)}</span>` : ''}<pre class="collection-code">${escapeHtml(node.code)}</pre></div>`;
   }
@@ -2761,9 +2791,19 @@ function layoutCollectionBoard() {
 function restoreCollectionRenameFocus() {
   if (!editingCollectionNodeId) return;
 
-  const fieldId = editingCollectionMode === 'move'
-    ? `collection-move-${editingCollectionNodeId}`
-    : `collection-rename-${editingCollectionNodeId}`;
+  let fieldId;
+
+  if (editingCollectionMode === 'move') {
+    fieldId = `collection-move-${editingCollectionNodeId}`;
+  } else {
+    const found   = findCollectionNode(collectionTreeForRender, editingCollectionNodeId);
+    const hasBody = !!(found && (found.node.type === 'note' || found.node.type === 'snippet'));
+
+    // Focus what you opened the editor to change: a note's own text, anything
+    // else's name.
+    fieldId = hasBody ? `collection-body-${editingCollectionNodeId}`
+                      : `collection-rename-${editingCollectionNodeId}`;
+  }
 
   const field = document.getElementById(fieldId);
   if (!field || typeof field.focus !== 'function') return;
@@ -2771,14 +2811,32 @@ function restoreCollectionRenameFocus() {
 
   field.focus();
 
-  // Only the text field has a caret to put back
-  if (editingCollectionMode !== 'rename') return;
+  // Only the name field has a caret worth putting back
+  if (!isCollectionRenameField(field)) return;
   const caret = renameCaret == null ? String(field.value || '').length : renameCaret;
   if (typeof field.setSelectionRange === 'function') field.setSelectionRange(caret, caret);
 }
 
 function isCollectionRenameField(el) {
   return !!(el && typeof el.id === 'string' && el.id.startsWith('collection-rename-'));
+}
+
+function isCollectionBodyField(el) {
+  return !!(el && typeof el.id === 'string' && el.id.startsWith('collection-body-'));
+}
+
+/**
+ * isFieldOfCollectionNode(el, nodeId)
+ *
+ * True for any of the fields belonging to one node's editor. A note is edited
+ * by TWO fields at once — its name and its text — so moving between them must
+ * not read as leaving the editor and commit it shut.
+ */
+function isFieldOfCollectionNode(el, nodeId) {
+  if (!el || !nodeId) return false;
+  return String(el.id) === `collection-rename-${nodeId}` ||
+         String(el.id) === `collection-body-${nodeId}` ||
+         String(el.id) === `${COLLECTION_MOVE_PREFIX}${nodeId}`;
 }
 
 
@@ -2826,6 +2884,9 @@ async function beginCollectionRename(id) {
   editingCollectionNodeId = nodeId;
   editingCollectionMode = 'rename';
   renameDraft = found.node.name || '';
+  bodyDraft   = (found.node.type === 'note' || found.node.type === 'snippet')
+    ? collectionNodeValue(found.node)     // a note's text, a snippet's code
+    : '';
   renameCaret = null;              // open with the caret at the end
   renameSession++;
 
@@ -2908,23 +2969,37 @@ async function commitCollectionRename() {
   if (editingCollectionMode !== 'rename') return;   // a move has nothing half-typed
 
   const draft = renameDraft.trim();
+  const body  = bodyDraft;
 
   // Bump the session first: our own re-render is about to fire focusout, and
   // the token is what turns that echo into a no-op.
   renameSession++;
   editingCollectionNodeId = null;
   renameDraft = '';
+  bodyDraft   = '';
   renameCaret = null;
 
-  // An empty name is treated as a cancel — a nameless node can't be told apart
-  // in the "Add to" list. An unchanged name writes nothing at all, so clicking
-  // in and back out doesn't fire a pointless storage event.
-  if (draft) {
-    const tree  = await getCollections();
-    const found = findCollectionNode(tree, id);
-    if (found && (found.node.name || '') !== draft) {
+  const tree  = await getCollections();
+  const found = findCollectionNode(tree, id);
+
+  if (found) {
+    const hasBody     = found.node.type === 'note' || found.node.type === 'snippet';
+    // An emptied name is left alone rather than saved: a nameless node can't
+    // be told apart in the "Add to" list. An emptied BODY is kept, because
+    // clearing a note to rewrite it is a reasonable thing to do.
+    const nameChanged = !!draft && (found.node.name || '') !== draft;
+    const bodyChanged = hasBody && body !== collectionNodeValue(found.node);
+
+    // Nothing changed means no write at all, so clicking in and back out
+    // doesn't fire a pointless storage event.
+    if (nameChanged || bodyChanged) {
       noteSelfMutation();
-      await queueCollectionWrite(current => renameCollectionNode(current, id, draft));
+      await queueCollectionWrite(current => {
+        let next = current;
+        if (nameChanged) next = renameCollectionNode(next, id, draft) || next;
+        if (bodyChanged) next = setCollectionNodeBody(next, id, body) || next;
+        return next;
+      });
     }
   }
 
@@ -2939,6 +3014,7 @@ function cancelCollectionRename() {
   editingCollectionNodeId = null;
   editingCollectionMode = 'rename';
   renameDraft = '';
+  bodyDraft   = '';
   renameCaret = null;
   renderCollectionSection();
 }
@@ -4174,6 +4250,12 @@ document.addEventListener('input', async (e) => {
     return;
   }
 
+  // Same for a note's text or a snippet's code
+  if (isCollectionBodyField(e.target)) {
+    bodyDraft = e.target.value;
+    return;
+  }
+
   // The filter box lives in the static toolbar, so re-rendering the tree under
   // it doesn't disturb what you're typing.
   if (e.target.id === 'collectionFilterInput') {
@@ -4214,9 +4296,11 @@ document.addEventListener('change', async (e) => {
 // and returning its promise is what lets a caller (or a test) know when that
 // has actually landed rather than racing it.
 document.addEventListener('keydown', async (e) => {
-  // Both inline editors: Escape closes either, Enter only means something in
-  // the text field (a select commits on choosing).
-  if (isCollectionRenameField(e.target) || isCollectionMoveField(e.target)) {
+  // Escape closes any of the inline editors; Enter only means something in the
+  // single-line name field. In a note's text or a snippet's code it has to
+  // insert a newline like it does anywhere else.
+  if (isCollectionRenameField(e.target) || isCollectionMoveField(e.target) ||
+      isCollectionBodyField(e.target)) {
     if (e.key === 'Escape') {
       e.preventDefault();
       cancelCollectionRename();
@@ -4239,10 +4323,22 @@ document.addEventListener('keydown', async (e) => {
 });
 
 document.addEventListener('focusout', async (e) => {
+  // Moving between the fields of the SAME editor isn't leaving it
+  if (isFieldOfCollectionNode(e.relatedTarget, editingCollectionNodeId)) return;
+
   // Leaving the "move to" select without choosing just closes it
   if (isCollectionMoveField(e.target)) {
     if (String(e.target.id) === `${COLLECTION_MOVE_PREFIX}${editingCollectionNodeId}`) {
       cancelCollectionRename();
+    }
+    return;
+  }
+
+  // A note's text field commits like its name does
+  if (isCollectionBodyField(e.target)) {
+    if (editingCollectionMode === 'rename' &&
+        String(e.target.id) === `collection-body-${editingCollectionNodeId}`) {
+      await commitCollectionRename();
     }
     return;
   }

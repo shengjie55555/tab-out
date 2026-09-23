@@ -1024,6 +1024,60 @@ async function testCollectWholeGroup() {
 }
 
 /* ================================================================
+   0g2. Editing a note edits its text, not an incidental name
+   ================================================================ */
+async function testCollectionBodyEditing() {
+  section('Collections — editing a note edits its text');
+  const app = await boot();
+  const nodeOf = (id) => app.sandbox.findCollectionNode(app.storage().collections, id).node;
+
+  await app.fire('rename-collection-node', { nodeId: '22' });   // the fixture's note
+  const html = app.els.collectedTree.innerHTML;
+
+  ok('the note text becomes a field',
+     /<textarea class="collection-body-edit"[^>]*id="collection-body-22"/.test(html), html.slice(0, 140));
+  ok('...prefilled with the note', html.includes('encoder_old'));
+  eq('...and the TEXT is what gets focus, not the name',
+     app.els['collection-body-22'].focused, true);
+  ok('...with the name field beside it', html.includes('id="collection-rename-22"'));
+
+  await app.fireEvent('input', { target: { id: 'collection-body-22', value: 'rewritten text' } });
+  ok('typing alone does not write yet', nodeOf('22').text.includes('encoder_old'));
+
+  await app.fireEvent('focusout', { target: { id: 'collection-body-22' } });
+  eq('clicking away saves the text', nodeOf('22').text, 'rewritten text');
+  ok('...and the editor closes', !app.els.collectedTree.innerHTML.includes('id="collection-body-22"'));
+
+  section('Collections — moving between the two fields keeps the editor open');
+  await app.fire('rename-collection-node', { nodeId: '22' });
+  await app.fireEvent('focusout', {
+    target:        { id: 'collection-rename-22' },
+    relatedTarget: { id: 'collection-body-22' },
+  });
+  ok('name → text does not commit it shut',
+     app.els.collectedTree.innerHTML.includes('id="collection-body-22"'));
+
+  section('Collections — Escape still discards');
+  await app.fireEvent('input', { target: { id: 'collection-body-22', value: 'discarded' } });
+  await app.fireEvent('keydown', { key: 'Escape', target: { id: 'collection-body-22' } });
+  eq('the text is left as it was', nodeOf('22').text, 'rewritten text');
+
+  section('Collections — a snippet edits its code the same way');
+  await app.fire('rename-collection-node', { nodeId: '23' });
+  ok('the code becomes a field',
+     app.els.collectedTree.innerHTML.includes('id="collection-body-23"'));
+  await app.fireEvent('input', { target: { id: 'collection-body-23', value: 'torchrun --nproc 2' } });
+  await app.fireEvent('focusout', { target: { id: 'collection-body-23' } });
+  eq('and it saves', nodeOf('23').code, 'torchrun --nproc 2');
+
+  section('Collections — a link still edits its name');
+  await app.fire('rename-collection-node', { nodeId: '4' });
+  ok('a link has no body field',
+     !app.els.collectedTree.innerHTML.includes('id="collection-body-4"'));
+  ok('...just its name', app.els.collectedTree.innerHTML.includes('id="collection-rename-4"'));
+}
+
+/* ================================================================
    0h. A batch close asks first; closing one tab does not
    ================================================================ */
 async function testBatchCloseConfirmation() {
@@ -1494,6 +1548,7 @@ const SUITES = [
   ['collections: entry kinds',  testCollectionKinds],
   ['collections: link paste',   testCollectionHyperlinkPaste],
   ['collections: auto groups',  testCollectionAutoGroups],
+  ['collections: body editing', testCollectionBodyEditing],
   ['closing: confirmation',     testBatchCloseConfirmation],
   ['theme',                     testTheme],
   ['theme: stylesheet',         testThemeStylesheet],
