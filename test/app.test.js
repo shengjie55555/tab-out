@@ -206,11 +206,18 @@ async function testCollectionModel() {
   eq('the input tree is untouched', JSON.stringify(COLLECTIONS), pristine);
 
   section('Collections — drop zones and resize maths');
-  const rect = { left: 100, width: 200 };
-  eq('the left half is "before"',  M.collectionDropZoneX(rect, 120), 'before');
-  eq('the right half is "after"',  M.collectionDropZoneX(rect, 280), 'after');
-  eq('exactly on the midpoint is "after"', M.collectionDropZoneX(rect, 200), 'after');
-  eq('a missing rect falls back', M.collectionDropZoneX(null, 10), 'after');
+  // Side by side (the board's grid): left/right edges order, the middle drops in
+  const wide = { left: 100, width: 200 };
+  eq('the left edge is "before"',  M.collectionDropZone(wide, 110, 0, 'x'), 'before');
+  eq('the middle is "inside"',     M.collectionDropZone(wide, 200, 0, 'x'), 'inside');
+  eq('the right edge is "after"',  M.collectionDropZone(wide, 290, 0, 'x'), 'after');
+
+  // Stacked (chips and nested cards): top/bottom order, the middle drops in
+  const row = { top: 100, height: 40 };
+  eq('...and stacked, the top is "before"',   M.collectionDropZone(row, 0, 105, 'y'), 'before');
+  eq('...the middle is "inside"',             M.collectionDropZone(row, 0, 120, 'y'), 'inside');
+  eq('...and the bottom is "after"',          M.collectionDropZone(row, 0, 135, 'y'), 'after');
+  eq('a missing rect falls back', M.collectionDropZone(null, 10, 10, 'x'), 'after');
 
   // A card of span N is N columns plus (N-1) gaps wide
   const colUnit = 280, colGap = 12;
@@ -236,47 +243,6 @@ async function testCollectionModel() {
   eq('a zero height is left at one', M.collectionRowSpan(0, 8, 12), 1);
   eq('a nonsense row unit is refused', M.collectionRowSpan(100, 0, 12), 1);
   eq('a missing gap still works', M.collectionRowSpan(16, 8, undefined), 2);
-
-  section('Collections — moving a node into another group');
-  const moved4 = M.reparentCollectionNode(COLLECTIONS, '4', '6');      // mid's link into sft
-  eq('it lands at the end of the new parent',
-     M.findCollectionNode(moved4, '4').parentId, '6');
-  eq('...and left the old one', M.findCollectionNode(moved4, '3').node.children.length, 1);
-  eq('...with nothing lost', JSON.stringify(M.countCollectionNodes(moved4)), JSON.stringify({ groups: 12, items: 12 }));
-  eq('the input tree is untouched', JSON.stringify(COLLECTIONS), pristine);
-
-  const toRoot = M.reparentCollectionNode(COLLECTIONS, '4', null);
-  eq('an empty parent means the top level', M.findCollectionNode(toRoot, '4').parentId, null);
-  eq('...and it really is at the root', M.findCollectionNode(toRoot, '4').index,
-     COLLECTIONS.nodes.length);
-
-  eq('a group cannot move inside itself',
-     M.reparentCollectionNode(COLLECTIONS, '2', '2'), null);
-  eq('...nor into its own subtree',
-     M.reparentCollectionNode(COLLECTIONS, '2', '6'), null);
-  eq('an unknown node is refused', M.reparentCollectionNode(COLLECTIONS, 'nope', '6'), null);
-  eq('an unknown parent is refused', M.reparentCollectionNode(COLLECTIONS, '4', 'nope'), null);
-
-  // Assert WHY, not just that the outcome was null: a cyclic move returns null
-  // anyway (the destination went away with the removed subtree), so the outcome
-  // can't show the guard is doing anything.
-  eq('the validator refuses a cycle', M.isValidCollectionReparent(COLLECTIONS, '2', '6'), false);
-  eq('...refuses moving into itself', M.isValidCollectionReparent(COLLECTIONS, '2', '2'), false);
-  eq('...refuses an unknown parent', M.isValidCollectionReparent(COLLECTIONS, '4', 'nope'), false);
-  eq('...and allows a move that is fine', M.isValidCollectionReparent(COLLECTIONS, '4', '6'), true);
-  eq('...including to the top level', M.isValidCollectionReparent(COLLECTIONS, '4', null), true);
-  ok('moving a node that is already last returns the same tree',
-     M.reparentCollectionNode(COLLECTIONS, '11', '9') === COLLECTIONS);
-
-  section('Collections — where a node may move to');
-  const targets = M.collectionMoveTargets(COLLECTIONS, '2');   // the v1 group
-  const ids = targets.map(t => t.id);
-  ok('the top level is always offered', ids.includes(''), JSON.stringify(ids));
-  ok('the node itself is not offered', !ids.includes('2'));
-  ok('nor anything inside it', !ids.includes('3') && !ids.includes('6') && !ids.includes('9'));
-  ok('but unrelated groups are', ids.includes('12') && ids.includes('14'));
-  ok('with readable path labels',
-     targets.some(t => t.label === 'Deep / L2'), JSON.stringify(targets.map(t => t.label)));
 
   section('Collections — card width');
   // The fixture omits span entirely, like anything saved before this existed
@@ -377,7 +343,7 @@ async function testCollectionRender() {
      (html.match(/class="collection-resize"/g) || []).length, 5);   // the five top-level groups
   ok('a board card carries its width', /data-depth="0"[^>]*data-span="1"/.test(html));
   ok('...and is draggable', /data-depth="0"[^>]*draggable="true"/.test(html));
-  ok('a nested card is not draggable', !/data-depth="1"[^>]*draggable="true"/.test(html));
+  ok('...and a nested one is draggable too', /data-depth="1"[^>]*draggable="true"/.test(html));
   ok('...and has no resize edge', !/data-depth="1"[^>]*[\s\S]{0,400}?collection-resize/.test(html));
 
   section('Collections — every board tile gets measured');
@@ -395,7 +361,7 @@ async function testCollectionRender() {
      rowSpans[0] && rowSpans[0].value, 3);   // harness rects are 10px tall
 
   ok('a loose leaf on the board is a tile, not a stray row',
-     /class="page-chip[^"]*" data-action="[^"]*" data-node-id="13" data-node-type="link" data-depth="0"/
+     /class="page-chip[^"]*"[^>]*data-node-id="13"[^>]*data-node-type="link"[^>]*data-depth="0"/
        .test(html), html.slice(0, 80));
   ok('...while a chip inside a group reports its own depth',
      /data-node-type="link" data-depth="1"/.test(html) ||
@@ -599,52 +565,11 @@ async function testCollectionInteractions() {
   const notOpened = await app.fire('open-collection-link', { nodeId: '5' });   // no scheme
   eq('a scheme-less entry opens nothing at all', notOpened.created, []);
 
-  section('Collections — moving a link to another group');
-  await app.fire('move-collection-node', { nodeId: '4' });
-  let moveHtml = app.els.collectedTree.innerHTML;
-  ok('the name gives way to a destination picker', moveHtml.includes('id="collection-move-4"'));
-  ok('...preselecting where it lives now', /<option value="3" selected>/.test(moveHtml), moveHtml.slice(0, 60));
-  ok('...and offering the other groups', /<option value="6">/.test(moveHtml));
-
-  await app.fireEvent('change', { target: { id: 'collection-move-4', value: '6' } });
-  const v1 = app.storage().collections.nodes[0].children[0];
-  ok('choosing a destination moves it there',
-     v1.children[1].children.some(c => c.id === '4'),
-     JSON.stringify(v1.children.map(c => c.id)));
-  ok('...and it left the old group',
-     !v1.children[0].children.some(c => c.id === '4'));
-  ok('...and the picker closed',
-     !app.els.collectedTree.innerHTML.includes('id="collection-move-4"'));
-
-  section('Collections — a group is never offered itself');
-  await app.fire('move-collection-node', { nodeId: '3' });
-  moveHtml = app.els.collectedTree.innerHTML;
-  ok('the group itself is not a destination', !/<option value="3"/.test(moveHtml));
-  ok('...nor anything inside it',
-     !/<option value="4"/.test(moveHtml) && !/<option value="5"/.test(moveHtml));
-  ok('...but unrelated groups are', /<option value="12"/.test(moveHtml));
-
-  await app.fireEvent('keydown', { key: 'Escape', target: { id: 'collection-move-3' } });
-  ok('Escape closes it', !app.els.collectedTree.innerHTML.includes('id="collection-move-3"'));
-
-  section('Collections — clicking away from the picker');
-  await app.fire('move-collection-node', { nodeId: '4' });
-  const v1Before = JSON.stringify(app.storage().collections.nodes[0].children[0]);
-  await app.fireEvent('focusout', { target: { id: 'collection-move-4' } });
-  ok('closing without choosing changes nothing',
-     JSON.stringify(app.storage().collections.nodes[0].children[0]) === v1Before);
-  ok('...and closes the picker',
-     !app.els.collectedTree.innerHTML.includes('id="collection-move-4"'));
-
   section('Collections — the edit fields own their clicks');
   await app.fire('rename-collection-node', { nodeId: '4' });
   ok('the rename field carries its own action',
      /id="collection-rename-4"[^>]*data-action="collection-edit-field"/.test(app.els.collectedTree.innerHTML));
   await app.fireEvent('keydown', { key: 'Escape', target: { id: 'collection-rename-4' } });
-  await app.fire('move-collection-node', { nodeId: '4' });
-  ok('...and so does the move picker',
-     /id="collection-move-4"[^>]*data-action="collection-edit-field"/.test(app.els.collectedTree.innerHTML));
-  await app.fireEvent('keydown', { key: 'Escape', target: { id: 'collection-move-4' } });
 
   section('Collections — typing is cheap');
   await app.fire('rename-collection-node', { nodeId: '12' });
@@ -781,7 +706,6 @@ function seedToolbar(app) {
   app.els.collectKindSelect    = app.makeEl('collectKindSelect');
   app.els.collectUrlInput      = app.makeEl('collectUrlInput');
   app.els.collectNameInput     = app.makeEl('collectNameInput');
-  app.els.collectLanguageInput = app.makeEl('collectLanguageInput');
   return app.els;
 }
 
@@ -800,17 +724,15 @@ async function testCollectionKinds() {
   eq('...with its whole text, newlines intact', note && note.text, 'A note about the run\nsecond line');
   eq('...and its name', note && note.name, 'Why we froze it');
 
-  section('Collections — adding a snippet');
-  els.collectKindSelect.value    = 'snippet';
-  els.collectUrlInput.value      = 'torchrun --nproc_per_node 8 train.py';
-  els.collectLanguageInput.value = 'bash';
+  section('Collections — snippets can no longer be created');
+  // The Code option is gone. A stale 'snippet' value has to do something sane
+  // rather than silently storing a node type nothing can produce.
+  els.collectKindSelect.value = 'snippet';
+  els.collectUrlInput.value   = 'echo hi';
   await app.fire('add-collection-link', {});
-
-  const snippet = allItems(app.storage().collections)
-    .find(n => n.type === 'snippet' && n.code === 'torchrun --nproc_per_node 8 train.py');
-  ok('the snippet is stored', !!snippet);
-  eq('...with its code', snippet && snippet.code, 'torchrun --nproc_per_node 8 train.py');
-  eq('...and its language', snippet && snippet.language, 'bash');
+  ok('an unknown kind falls back to a link',
+     allItems(app.storage().collections).some(n => n.type === 'link' && n.url === 'echo hi'),
+     JSON.stringify(allItems(app.storage().collections).map(n => n.type)));
 
   section('Collections — a pasted list becomes several entries');
   els.collectKindSelect.value = 'link';
@@ -934,11 +856,7 @@ async function testCollectionAutoGroups() {
   await app.fire('add-collection-link', {});
   ok('a note group is called Note1', !!groupNamed('Note1'));
 
-  els.collectKindSelect.value    = 'snippet';
-  els.collectUrlInput.value      = 'echo hi';
-  els.collectLanguageInput.value = 'bash';
-  await app.fire('add-collection-link', {});
-  ok('a code group is called Code1', !!groupNamed('Code1'));
+  // (snippet has no UI any more, so only the two real kinds are exercised here)
 
   section('Collections — a pasted list is one group, not many');
   els.collectKindSelect.value = 'link';
@@ -1075,6 +993,230 @@ async function testCollectionBodyEditing() {
   ok('a link has no body field',
      !app.els.collectedTree.innerHTML.includes('id="collection-body-4"'));
   ok('...just its name', app.els.collectedTree.innerHTML.includes('id="collection-rename-4"'));
+}
+
+/* ================================================================
+   0g3. The note Markdown renderer
+
+   This is the one place a note's own text becomes markup on purpose, so it
+   gets the adversarial treatment rather than a happy-path check.
+   ================================================================ */
+async function testNoteMarkdown() {
+  section('Notes — links');
+  const app = await boot();
+  const md = (text) => app.sandbox.renderNoteMarkdown(text);
+
+  eq('a link renders', md('[Gmail](https://mail.google.com/)'),
+     '<p><a href="https://mail.google.com/" target="_blank" rel="noopener noreferrer">Gmail</a></p>');
+  eq('a javascript: link is left as text', md('[x](javascript:alert(1))'),
+     '<p>[x](javascript:alert(1))</p>');
+  eq('a data: link is left as text too',
+     md('[x](data:text/html,<b>)').includes('<a '), false);
+
+  section('Notes — images');
+  ok('a remote image renders', md('![](https://x.example/a.png)').includes('<img class="note-image"'));
+  eq('an embedded image renders', md('![](data:image/png;base64,AAAA)').includes('data:image/png;base64,AAAA'), true);
+  eq('a javascript: image does not', md('![](javascript:alert(1))').includes('<img'), false);
+
+  section('Notes — emphasis, and the case this library is full of');
+  eq('bold renders', md('**hi**'), '<p><strong>hi</strong></p>');
+  eq('italic renders', md('*hi*'), '<p><em>hi</em></p>');
+  // Underscores are NOT emphasis: these are the strings people actually store
+  eq('underscores are not emphasis', md('wsj_d2d_mem_mid_0901_1'), '<p>wsj_d2d_mem_mid_0901_1</p>');
+  eq('...nor in a path', md('wsj/d2d_mem/mid-0901-1'), '<p>wsj/d2d_mem/mid-0901-1</p>');
+
+  section('Notes — code spans');
+  eq('a code span renders', md('`a < b`'), '<p><code>a &lt; b</code></p>');
+  eq('...and a URL inside one is never linkified',
+     md('`https://x.example`'), '<p><code>https://x.example</code></p>');
+
+  section('Notes — lists and paragraphs');
+  eq('a bullet list renders', md('- one\n- two'), '<ul><li>one</li><li>two</li></ul>');
+  eq('a numbered list renders', md('1. one\n2. two'), '<ol><li>one</li><li>two</li></ol>');
+  eq('a line opening with *emphasis* is not a bullet', md('*hi* there'), '<p><em>hi</em> there</p>');
+  eq('a blank line splits paragraphs', md('one\n\ntwo'), '<p>one</p><p>two</p>');
+  eq('a single newline is a break', md('one\ntwo'), '<p>one<br>two</p>');
+  eq('an empty note renders nothing', md('   '), '');
+
+  section('Notes — a note cannot smuggle markup');
+  eq('angle brackets are escaped', md('<img src=x onerror=alert(1)>'),
+     '<p>&lt;img src=x onerror=alert(1)&gt;</p>');
+  eq('a quote in a label cannot open an attribute',
+     md('[a" onmouseover="x](https://x.example)').includes('onmouseover="'), false);
+  eq('...nor can one in a url',
+     md('[x](https://x.example/?a=")').includes('href="https://x.example/?a=&quot;"'), true);
+
+  section('Notes — a recovered hyperlink becomes Markdown');
+  const link = app.sandbox.markdownLinkFrom;
+
+  eq('both halves survive', link({ url: 'https://x.example/a', text: 'A' }), '[A](https://x.example/a)');
+  eq('brackets in the label are dropped so it cannot close early',
+     link({ url: 'https://x.example', text: 'a [b] c' }), '[a b c](https://x.example)');
+  eq('a paren in the address is encoded so it cannot end the url',
+     link({ url: 'https://x.example/a)b', text: 'x' }), '[x](https://x.example/a%29b)');
+  eq('a missing label falls back to the address',
+     link({ url: 'https://x.example', text: '' }), '[https://x.example](https://x.example)');
+
+  section('Notes — image sizing');
+  eq('a wide image is scaled down',
+     app.sandbox.scaledNoteImage(3200, 1800, 1600), { width: 1600, height: 900 });
+  eq('a small one is left alone',
+     app.sandbox.scaledNoteImage(800, 600, 1600), { width: 800, height: 600 });
+  eq('a nonsense size is refused', app.sandbox.scaledNoteImage(0, 0, 1600), null);
+}
+
+/* ================================================================
+   0g4. Notes in the editor: markdown, live preview, images
+   ================================================================ */
+async function testNoteEditor() {
+  section('Notes — the editor shows what the Markdown will look like');
+  const app = await boot();
+  // Created on demand like the harness does, so a missing element reads as an
+  // empty one and fails the assertion rather than throwing.
+  const el = (id) => (app.els[id] = app.els[id] || app.makeEl(id));
+
+  await app.fire('rename-collection-node', { nodeId: '22' });
+  ok('a preview appears under the field',
+     app.els.collectedTree.innerHTML.includes('id="collection-preview-22"'));
+
+  await app.fireEvent('input', { target: { id: 'collection-body-22', value: '**bold** and `code`' } });
+  const preview = el('collection-preview-22').innerHTML;
+  ok('...following what you type', preview.includes('<strong>bold</strong>'), preview);
+  ok('...code spans included', preview.includes('<code>code</code>'));
+
+  await app.fireEvent('focusout', { target: { id: 'collection-body-22' } });
+  ok('and the saved note is the rendered form',
+     /<div class="collection-note"><p><strong>bold<\/strong>/.test(app.els.collectedTree.innerHTML),
+     app.els.collectedTree.innerHTML.slice(0, 120));
+
+  section('Notes — pasting an image');
+  await app.fire('rename-collection-node', { nodeId: '22' });
+  const field = el('collection-body-22');
+  field.value = 'see ';
+  field.selectionStart = field.selectionEnd = 4;
+
+  await app.fireEvent('paste', {
+    target: field,
+    clipboardData: {
+      items: [{ kind: 'file', type: 'image/png', getAsFile: () => ({ width: 3200, height: 1800 }) }],
+    },
+  });
+
+  ok('the markdown lands at the caret', field.value.startsWith('see ![]('), field.value.slice(0, 40));
+  ok('...carrying the embedded image', field.value.includes('data:image/webp;base64,STUB'));
+  ok('...and the preview shows it',
+     el('collection-preview-22').innerHTML.includes('<img class="note-image"'));
+
+  section('Notes — pasting a hyperlink brings its address');
+  await app.fireEvent('keydown', { key: 'Escape', target: { id: 'collection-body-22' } });
+  await app.fire('rename-collection-node', { nodeId: '22' });
+
+  const linkField = el('collection-body-22');
+  linkField.value = '';
+  linkField.selectionStart = linkField.selectionEnd = 0;
+
+  await app.fireEvent('paste', {
+    target: linkField,
+    clipboardData: {
+      items: [],
+      getData: (type) => (type === 'text/html'
+        ? '<a href="https://tracker.example/run-1">mid-0901-1</a>'
+        : 'mid-0901-1'),
+    },
+  });
+
+  eq('it lands as a Markdown link, not just the words',
+     linkField.value, '[mid-0901-1](https://tracker.example/run-1)');
+  ok('...and the preview renders it as a link',
+     el('collection-preview-22').innerHTML
+       .includes('<a href="https://tracker.example/run-1" target="_blank"'));
+
+  section('Notes — an ordinary text paste is left to the browser');
+  linkField.value = 'typed';
+  await app.fireEvent('paste', { target: linkField, clipboardData: { items: [], getData: () => '' } });
+  eq('nothing is inserted for it', linkField.value, 'typed');
+}
+
+/* ================================================================
+   0g5. Dragging: any card, but only within its own level
+   ================================================================ */
+async function testCollectionDrag() {
+  section('Collections — which cards drag');
+  const app = await boot();
+  const html = app.els.collectedTree.innerHTML;
+
+  ok('a top-level card drags', /data-depth="0"[^>]*draggable="true"/.test(html));
+  ok('...and so does a nested one', /data-depth="1"[^>]*draggable="true"/.test(html), html.slice(0, 100));
+  ok('...and so does a leaf chip',
+     /class="page-chip[^"]*"[^>]*draggable="true"[^>]*data-node-type="link"/.test(html));
+
+  section('Collections — reordering siblings inside a group');
+  const childrenOf = (id) => app.sandbox
+    .findCollectionNode(app.storage().collections, id).node.children.map(c => c.id);
+
+  eq('v1 starts as mid, sft, rl', childrenOf('2'), ['3', '6', '9']);
+
+  const nodeFor = (nodeId, depth) => {
+    const el = app.makeEl('node');
+    el.dataset = { nodeId, depth: String(depth) };
+    // A wide, short box, so the two axes give different answers for the same
+    // point — with the harness's default square, "x" and "y" are
+    // indistinguishable and the axis choice would go untested.
+    el.getBoundingClientRect = () => ({ left: 0, top: 0, width: 100, height: 10 });
+    return el;
+  };
+
+  // 5,5 is inside on the vertical axis (0.5 of 10) and at the very start on
+  // the horizontal one (0.05 of 100) — so passing both is a real axis test.
+  const drag = (node, type, x = 1, y = 1) => app.fireEvent(type, {
+    target: { closest: () => node },
+    clientX: x, clientY: y,
+    dataTransfer: { setData() {}, types: [], effectAllowed: '' },
+  });
+
+  const mid = nodeFor('3', 2);
+  await drag(nodeFor('9', 2), 'dragstart');
+  await drag(mid, 'dragover');                 // a nested row orders vertically
+  ok('a sibling takes the drop marker', mid.classList.contains('is-drop-before'));
+
+  await drag(mid, 'drop');
+  eq('...and the siblings reorder', childrenOf('2'), ['9', '3', '6']);
+
+  section('Collections — the middle of a card drops INTO it');
+  const sft = nodeFor('6', 2);
+  await drag(nodeFor('4', 3), 'dragstart');    // a link inside mid
+  await drag(sft, 'dragover', 5, 5);
+  ok('a group shows an "into" marker', sft.classList.contains('is-drop-into'));
+
+  await drag(sft, 'drop', 5, 5);
+  ok('...and the link moved into it', childrenOf('6').includes('4'), JSON.stringify(childrenOf('6')));
+  ok('...and out of the one it was in', !childrenOf('3').includes('4'));
+
+  section('Collections — dropping onto the board lifts a node out');
+  const boardCard = nodeFor('19', 0);
+  await drag(nodeFor('4', 3), 'dragstart');
+  await drag(boardCard, 'dragover');           // a board card orders horizontally
+  ok('...a board card takes it', boardCard.classList.contains('is-drop-before'));
+
+  await drag(boardCard, 'drop');
+  ok('...and it is a top-level node now',
+     app.storage().collections.nodes.map(n => n.id).includes('4'),
+     JSON.stringify(app.storage().collections.nodes.map(n => n.id)));
+
+  section('Collections — a group still cannot go inside itself');
+  const v1 = nodeFor('2', 1);
+  await drag(nodeFor('2', 1), 'dragstart');
+  await drag(v1, 'dragover', 5, 5);
+  ok('its own row is not a drop target', !v1.classList.contains('is-drop-into'));
+
+  const descendant = nodeFor('3', 2);          // sits inside v1
+  await drag(descendant, 'dragover', 5, 5);
+  ok('...nor is one of its own descendants', !descendant.classList.contains('is-drop-into'));
+
+  const beforeCycle = JSON.stringify(app.storage().collections);
+  await drag(descendant, 'drop', 5, 5);
+  eq('...and dropping there changes nothing',
+     JSON.stringify(app.storage().collections), beforeCycle);
 }
 
 /* ================================================================
@@ -1548,6 +1690,9 @@ const SUITES = [
   ['collections: entry kinds',  testCollectionKinds],
   ['collections: link paste',   testCollectionHyperlinkPaste],
   ['collections: auto groups',  testCollectionAutoGroups],
+  ['notes: markdown',           testNoteMarkdown],
+  ['notes: the editor',         testNoteEditor],
+  ['collections: dragging',     testCollectionDrag],
   ['collections: body editing', testCollectionBodyEditing],
   ['closing: confirmation',     testBatchCloseConfirmation],
   ['theme',                     testTheme],

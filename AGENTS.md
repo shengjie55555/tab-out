@@ -16,7 +16,7 @@ Before doing anything technical, tell the user what they're about to get:
 > - **Collapse from here** — collapse a card and the group collapses in Chrome too
 > - **Stays current** — tabs you open, close or regroup show up right away; there's nothing to refresh
 > - **Close tabs with style** satisfying swoosh sound + confetti burst
-> - **A collected-tabs library** — a nestable tree of links, notes and code you build yourself, with drag-to-arrange cards
+> - **A collected-tabs library** — a nestable tree of links and Markdown notes (images and all), with drag-to-arrange cards
 > - **Duplicate detection** flags when you have the same page open twice
 > - **Click any tab title to jump to it** even across different Chrome windows
 > - **Save for later** bookmark individual tabs to a checklist before closing them
@@ -92,10 +92,10 @@ Once the extension is loaded:
 >
 > Then scroll down to **Collected tabs**, the library:
 >
-> 1. **Add anything** from the bar at the top: a link, a note, or a code snippet. Pasting several lines makes one entry per line, all in one new group.
+> 1. **Add anything** from the bar at the top: a link, or a note written in Markdown. Pasting several lines makes one entry per line, all in one new group.
 > 2. **Everything added at the top level gets its own group** — Link1, Note1, Code1 and so on — so the board stays a board of cards.
-> 3. **Drag a card** to reorder it, or drag its right **edge** to make it wider; widths snap to the grid so the columns stay lined up.
-> 4. **Move an entry anywhere** with the arrow icon, filter by text or status on the right, and tag an entry to-do / doing / done / dropped with the dot on its row.
+> 3. **Drag anything to move it** — drop on a card's edge to order it, or on its middle to move it inside that group. Board cards also widen by dragging their right edge.
+> 4. **Filter** by text or status on the right, and tag an entry to-do / doing / done / dropped with the dot on its row.
 >
 > That's it! No server to run. Everything works right away.
 

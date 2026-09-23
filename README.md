@@ -39,10 +39,12 @@ The agent will walk you through it. Takes about 1 minute.
 ### Collected tabs — a library you build
 
 - **A nestable tree** of groups you name and arrange, as deep as you like
-- **Three kinds of entry**: **links** (open on click), **notes** (prose), and **code** (monospace, copyable). Anything without a usable address copies to the clipboard instead of opening
+- **Two kinds of entry**: **links** (open on click) and **notes** (Markdown). Anything without a usable address copies to the clipboard instead of opening. (Entries saved as *code* under an earlier three-kind version still render and edit — there is simply no way to make a new one.)
+- **Notes are Markdown** — links, images, bold/italic, lists and inline code — written with a live preview underneath the editor
+- **Paste a hyperlink** into a note and the address comes with it, as `[the words](the url)`: the plain-text flavour of a copy has usually dropped it
+- **Paste or drop an image straight into a note.** It is downscaled and re-encoded, then stored inside the note, so it travels with your backup. That does eat into `chrome.storage.local`'s 10MB, though: expect a few dozen screenshots rather than hundreds
 - **Collect from your tabs** — the folder icon on any tab files it into the library; the one on a group card files the whole group
-- **Drag to arrange** — drag a card to reorder it, drag its right edge to snap it between 1 and 4 columns wide. The board packs tiles tightly rather than leaving holes
-- **Move anything anywhere** — the arrow on any entry moves it to another group or to the top level
+- **Drag anything to move it** — a note, a link or a whole group. Drop on a card's edge to put it before or after, or on its middle to move it *inside* that group. Board cards also resize by dragging their right edge, snapping between 1 and 4 columns. The board packs tiles tightly rather than leaving holes
 - **Status marks** — tag an entry to-do / doing / done / dropped and filter by it
 - **Filter** — by text or status, keeping matching branches in context and never hiding a hit inside a collapsed group
 - **Paste a list** — a multi-line paste becomes one entry per line, all in one new group

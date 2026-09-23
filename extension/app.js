@@ -430,7 +430,6 @@ let collectionsWriteChain = Promise.resolve();
 // module scope rather than read from the DOM, because live sync re-renders the
 // tree out from under you — see the rename state machine in the handlers.
 let editingCollectionNodeId = null;   // string id, or null
-let editingCollectionMode   = 'rename'; // 'rename' (a text field) or 'move' (a select)
 let renameDraft             = '';     // what the name field currently shows
 let bodyDraft               = '';     // ...and the body field, for a note or snippet
 let renameCaret             = null;   // selectionStart as of the last input
@@ -936,17 +935,10 @@ function addCollectionNote(tree, options) {
   }));
 }
 
-function addCollectionSnippet(tree, options) {
-  const opts = options || {};
-  const code = typeof opts.code === 'string' ? opts.code : '';
-  if (!code.trim()) return null;
-
-  return insertCollectionItem(tree, opts.groupId, Object.assign(collectionItemFields(opts), {
-    type: 'snippet',
-    code,
-    language: typeof opts.language === 'string' ? opts.language : '',
-  }));
-}
+// There is deliberately no addCollectionSnippet: snippets are no longer
+// something you can create. The TYPE is still understood everywhere it is read
+// — sanitising, rendering, editing, moving — so anything made before the
+// option was removed keeps working instead of being dropped on the next read.
 
 function addCollectionGroup(tree, options) {
   const opts = options || {};
@@ -1123,103 +1115,44 @@ function setCollectionNodeSpan(tree, id, span) {
   return nodes ? Object.assign({}, tree, { nodes }) : null;
 }
 
-/**
- * collectionMoveTargets(tree, id)
- *
- * Everywhere a node could move to: the top level, plus every group that is
- * neither the node itself nor inside it. Offering an invalid destination would
- * let the UI present a move the model then silently refuses.
- */
-function collectionMoveTargets(tree, id) {
-  const found = findCollectionNode(tree, id);
-  if (!found) return [];
 
-  const excluded = new Set(collectCollectionIds(found.node));
 
-  const targets = [{ id: '', label: 'Top level' }];
-  for (const entry of flattenCollectionTree(tree)) {
-    if (entry.type !== 'group' || excluded.has(String(entry.id))) continue;
-    targets.push({ id: entry.id, label: entry.path });
-  }
-  return targets;
-}
-
-/**
- * reparentCollectionNode(tree, id, parentId)
- *
- * Moves a node to the END of another group (or to the top level, for an empty
- * parentId). Distinct from moveCollectionNode(), which places a node relative
- * to a sibling for drag-and-drop; this one answers "put it in there".
- *
- * → a new tree; null if the move is impossible (unknown node, unknown parent,
- * or a group being dropped inside itself); the SAME reference when the node is
- * already the last child of that parent, so callers can skip the write.
- */
-function isValidCollectionReparent(tree, id, parentId) {
-  const found = findCollectionNode(tree, id);
-  if (!found) return false;
-
-  const dest = (parentId === null || parentId === undefined || parentId === '')
-    ? null : String(parentId);
-
-  if (dest === null) return true;
-  if (dest === String(id)) return false;
-  if (isCollectionDescendant(tree, id, dest)) return false;
-
-  const parent = findCollectionNode(tree, dest);
-  return !!(parent && parent.node.type === 'group');
-}
-
-function reparentCollectionNode(tree, id, parentId) {
-  // Split per the validator because the cycle check is otherwise invisible: a
-  // cyclic move fails later anyway, when the destination turns out to have been
-  // inside the subtree that was just removed. The outcome alone can't tell you
-  // the guard is doing anything — and without it, correctness would rest on
-  // insertCollectionNodes failing for a missing parent, which is a much thinner
-  // thread than it looks.
-  if (!isValidCollectionReparent(tree, id, parentId)) return null;
-
-  const found = findCollectionNode(tree, id);
-  const dest = (parentId === null || parentId === undefined || parentId === '')
-    ? null : String(parentId);
-
-  let siblings = null;
-  if (dest === null) {
-    siblings = tree.nodes;
-  } else {
-    const parent = findCollectionNode(tree, dest);
-    if (parent && parent.node.type === 'group') siblings = parent.node.children;
-  }
-  if (!Array.isArray(siblings)) return null;
-
-  const alreadyLast = String(found.parentId === null || found.parentId === undefined ? '' : found.parentId)
-                   === String(dest === null ? '' : dest)
-                   && siblings.length > 0
-                   && String(siblings[siblings.length - 1].id) === String(id);
-  if (alreadyLast) return tree;
-
-  const without = removeCollectionNodes(tree.nodes, id);
-  if (!without) return null;
-
-  const nodes = insertCollectionNodes(without, dest, Number.MAX_SAFE_INTEGER, found.node);
-  if (!nodes) return null;
-
-  return Object.assign({}, tree, { nodes });
-}
 
 
 /* ---- drag and drop ------------------------------------------------- */
 
 /**
- * collectionDropZoneX(rect, clientX)
+ * collectionDropZone(rect, clientX, clientY, axis)
  *
- * Which half of a card the pointer is over, for reordering the board. Pure,
- * and it takes a rect rather than an event so it can be unit-tested — the
- * harness has no layout engine, so an event-driven version would test nothing.
+ * Where in a drop target the pointer is. The ends mean "put it before/after
+ * this one", the middle means "put it inside this group" — which is how a leaf
+ * gets moved into a group now that the "Move to…" button is gone.
+ *
+ * The axis follows the container: top-level nodes sit side by side in the
+ * board's grid, so left/right orders them, while chips and nested cards stack
+ * vertically, so top/bottom does. Three meanings either way.
+ *
+ * Pure, and it takes a rect rather than an event so it can be unit-tested —
+ * the harness has no layout engine, so an event-driven version tests nothing.
  */
-function collectionDropZoneX(rect, clientX) {
-  if (!rect || typeof rect.left !== 'number' || !rect.width) return 'after';
-  return (clientX - rect.left) / rect.width < 0.5 ? 'before' : 'after';
+function collectionDropZone(rect, clientX, clientY, axis) {
+  if (!rect) return 'after';
+
+  if (axis === 'x') {
+    if (typeof rect.left !== 'number' || !rect.width) return 'after';
+
+    const offset = (clientX - rect.left) / rect.width;
+    if (offset < 0.25) return 'before';
+    if (offset > 0.75) return 'after';
+    return 'inside';
+  }
+
+  if (typeof rect.top !== 'number' || !rect.height) return 'after';
+
+  const offset = (clientY - rect.top) / rect.height;
+  if (offset < 0.3) return 'before';
+  if (offset > 0.7) return 'after';
+  return 'inside';
 }
 
 /**
@@ -1247,7 +1180,7 @@ function collectionRowSpan(height, rowUnit, gap) {
  * Widths land on whole columns so card edges always line up with the grid —
  * a freely-dragged width would leave the board ragged.
  *
- * Pure for the same reason as collectionDropZoneX.
+ * Pure for the same reason as collectionDropZone().
  */
 function collectionSpanFromDrag(startWidth, dx, colUnit, gap, maxColumns) {
   // Guard the column width itself: a zero unit would divide into a huge span
@@ -1792,7 +1725,6 @@ const ICONS = {
   chevron: `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" /></svg>`,
   plus:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>`,
   folder:  `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12.75V12A2.25 2.25 0 0 1 4.5 9.75h15A2.25 2.25 0 0 1 21.75 12v.75m-8.69-6.44-2.12-2.12a1.5 1.5 0 0 0-1.061-.44H4.5A2.25 2.25 0 0 0 2.25 6v12a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9a2.25 2.25 0 0 0-2.25-2.25h-5.379a1.5 1.5 0 0 1-1.06-.44Z" /></svg>`,
-  move:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M4 12h14m0 0-5-5m5 5-5 5" /></svg>`,
   note:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h10" /></svg>`,
   code:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m9 8-4 4 4 4m6-8 4 4-4 4" /></svg>`,
   copy:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 0 1-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H6.75a9.06 9.06 0 0 1 1.5.124m7.5 10.376h3.375c.621 0 1.125-.504 1.125-1.125V11.25c0-4.46-3.243-8.161-7.5-8.876a9.06 9.06 0 0 0-1.5-.124H9.375c-.621 0-1.125.504-1.125 1.125v3.5m7.5 10.375H9.375a1.125 1.125 0 0 1-1.125-1.125v-9.25m12 6.625v-1.875a3.375 3.375 0 0 0-3.375-3.375h-1.5a1.125 1.125 0 0 1-1.125-1.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H9.75" /></svg>`,
@@ -2045,6 +1977,226 @@ function buildOverflowChips(hiddenTabs, urlCounts = {}) {
     <div class="page-chip page-chip-overflow clickable" data-action="expand-chips">
       <span class="chip-text">+${hiddenTabs.length} more</span>
     </div>`;
+}
+
+
+/* ----------------------------------------------------------------
+   NOTE MARKDOWN
+
+   Notes hold Markdown rather than HTML, for two reasons that both matter
+   here: what lands in chrome.storage stays plain text you can read in a
+   backup, and rendering a subset I wrote myself means the set of things that
+   can become markup is exactly the set I chose.
+
+   The renderer escapes the whole body FIRST and only then applies inline
+   transforms, so an angle bracket a note contains is already &lt; by the time
+   anything looks for markup. Attribute values are safe for the same reason:
+   a quote in a URL or an alt is &quot; before it reaches an attribute.
+
+   Underscores are deliberately NOT emphasis. This library is full of things
+   like wsj_d2d_mem_mid_0901_1, and italicising them would be a mess.
+   ---------------------------------------------------------------- */
+
+/** Images may be remote or embedded; a data URL is how a pasted one is kept. */
+function isSafeImageSrc(value) {
+  return /^(https?:|data:image\/)/i.test(String(value || '').trim());
+}
+
+/**
+ * renderNoteInline(escaped)
+ *
+ * The inline pass, over text that has ALREADY been escaped. Code spans are
+ * pulled out first and parked behind placeholders, so a URL inside backticks
+ * stays a URL and never becomes a link.
+ */
+function renderNoteInline(escaped) {
+  const parked = [];
+  const park = (html) => `\u0001${parked.push(html) - 1}\u0001`;
+
+  let out = escaped;
+
+  out = out.replace(/`([^`]+)`/g, (whole, code) => park(`<code>${code}</code>`));
+
+  out = out.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (whole, alt, src) =>
+    isSafeImageSrc(src) ? park(`<img class="note-image" src="${src}" alt="${alt}" loading="lazy">`) : whole);
+
+  out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (whole, label, href) =>
+    isSafeHttpUrl(href) ? park(`<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`) : whole);
+
+  // Asterisks only — see the note above about underscores
+  out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  out = out.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+
+  return out.replace(/\u0001(\d+)\u0001/g, (whole, index) => parked[Number(index)] || '');
+}
+
+/**
+ * renderNoteMarkdown(text)
+ *
+ * Block pass: paragraphs, unordered and ordered lists, single newlines as
+ * breaks (what people expect when they press Enter in a note).
+ */
+function renderNoteMarkdown(text) {
+  const source = String(text || '');
+  if (!source.trim()) return '';
+
+  const blocks = [];
+  let list = null;
+  let paragraph = [];
+
+  const flushList = () => {
+    if (!list) return;
+    const items = list.items.map(item => `<li>${renderNoteInline(item)}</li>`).join('');
+    blocks.push(`<${list.tag}>${items}</${list.tag}>`);
+    list = null;
+  };
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    blocks.push(`<p>${paragraph.map(renderNoteInline).join('<br>')}</p>`);
+    paragraph = [];
+  };
+
+  for (const line of escapeHtml(source).split('\n')) {
+    // The bullet needs whitespace after the marker, which keeps a line that
+    // starts with *emphasis* from being read as a list item.
+    const bullet   = /^\s*[-*]\s+(.*)$/.exec(line);
+    const numbered = /^\s*\d+[.)]\s+(.*)$/.exec(line);
+
+    if (bullet || numbered) {
+      flushParagraph();
+      const tag = bullet ? 'ul' : 'ol';
+      if (!list || list.tag !== tag) { flushList(); list = { tag, items: [] }; }
+      list.items.push((bullet || numbered)[1]);
+      continue;
+    }
+
+    flushList();
+
+    if (!line.trim()) { flushParagraph(); continue; }
+    paragraph.push(line);
+  }
+
+  flushList();
+  flushParagraph();
+
+  return blocks.join('');
+}
+
+/**
+ * scaledNoteImage(width, height, maxWidth)
+ *
+ * The size an image is downscaled to before being embedded. Pure, so the
+ * arithmetic is testable — the harness has no canvas.
+ */
+// How wide an embedded image is allowed to be. Big enough to read a
+// screenshot, small enough that a few dozen fit in chrome.storage.local's
+// 10MB alongside everything else.
+const NOTE_IMAGE_MAX_WIDTH = 1600;
+
+/** The first image file on a clipboard's item list, or null. */
+function imageFromClipboard(clipboardData) {
+  if (!clipboardData || !clipboardData.items) return null;
+
+  for (const item of clipboardData.items) {
+    if (item.kind === 'file' && String(item.type || '').startsWith('image/')) {
+      const file = item.getAsFile();
+      if (file) return file;
+    }
+  }
+  return null;
+}
+
+/**
+ * embedImageFile(file)
+ *
+ * Downscales and re-encodes a pasted or dropped image, and returns it as
+ * Markdown. This is the only reason a note can hold a screenshot at all:
+ * there is no URL to point at, and an extension has nowhere to put a file, so
+ * the image itself has to go into chrome.storage as a data URL.
+ *
+ * webp first — it keeps text legible at a fraction of PNG's size. If the
+ * browser will not encode it, jpeg is the fallback; a multi-megabyte png
+ * would eat the storage quota in a dozen screenshots.
+ */
+async function embedImageFile(file) {
+  try {
+    const bitmap = await createImageBitmap(file);
+    const size   = scaledNoteImage(bitmap.width, bitmap.height, NOTE_IMAGE_MAX_WIDTH);
+    if (!size) return '';
+
+    const canvas = document.createElement('canvas');
+    canvas.width  = size.width;
+    canvas.height = size.height;
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, size.width, size.height);
+
+    let data = canvas.toDataURL('image/webp', 0.85);
+    if (!data.startsWith('data:image/webp')) data = canvas.toDataURL('image/jpeg', 0.85);
+
+    return `![](${data})`;
+  } catch (err) {
+    console.warn('[tab-out] Could not embed that image:', err);
+    return '';
+  }
+}
+
+/** Drops text in at the caret, and keeps the draft in step. */
+function insertNoteText(field, text) {
+  const value = String(field.value || '');
+  const start = typeof field.selectionStart === 'number' ? field.selectionStart : value.length;
+  const end   = typeof field.selectionEnd   === 'number' ? field.selectionEnd   : start;
+
+  field.value = value.slice(0, start) + text + value.slice(end);
+
+  const caret = start + text.length;
+  if (typeof field.setSelectionRange === 'function') field.setSelectionRange(caret, caret);
+
+  bodyDraft = field.value;
+}
+
+/** Repaints the editor's preview from the current draft. */
+function refreshNotePreview() {
+  const preview = document.getElementById(`collection-preview-${editingCollectionNodeId}`);
+  if (preview) setHTML(preview, renderNoteMarkdown(bodyDraft));
+}
+
+/** Inserts an image into a note, then repaints the preview. */
+async function insertNoteImage(field, file) {
+  const markdown = await embedImageFile(file);
+  if (!markdown) {
+    showToast('Could not read that image');
+    return;
+  }
+
+  insertNoteText(field, markdown);
+  refreshNotePreview();
+}
+
+/**
+ * markdownLinkFrom(link)
+ *
+ * Turns a recovered hyperlink into `[text](url)`. Both halves have to be made
+ * safe for the Markdown the note is written in: brackets in the label would
+ * close it early, and a closing paren or a space in the address would end the
+ * URL — the same two characters the renderer's pattern stops at.
+ */
+function markdownLinkFrom(link) {
+  const label = String(link.text || link.url || '').replace(/[[\]]/g, '').trim() || link.url;
+  const href  = String(link.url || '').replace(/[)\s]/g, ch => (ch === ')' ? '%29' : ''));
+
+  return `[${label}](${href})`;
+}
+
+function scaledNoteImage(width, height, maxWidth) {
+  const w = Number(width);
+  const h = Number(height);
+  const limit = Number(maxWidth);
+
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
+  if (!Number.isFinite(limit) || limit <= 0) return { width: Math.round(w), height: Math.round(h) };
+
+  const scale = Math.min(1, limit / w);
+  return { width: Math.round(w * scale), height: Math.round(h * scale) };
 }
 
 
@@ -2376,33 +2528,9 @@ function collectionFaviconHtml(node) {
  * The name, or the rename field when this node is being edited. `wrap` lets a
  * link render its name as an anchor without needing a second code path.
  */
-/**
- * renderCollectionMoveSelect(node)
- *
- * The "move to another group" control, which takes over the name slot the same
- * way the rename field does. Options come from collectionMoveTargets(), so an
- * invalid destination (the node itself, or anything inside it) is never
- * offered in the first place.
- */
-function renderCollectionMoveSelect(node) {
-  const found   = findCollectionNode(collectionTreeForRender, node.id);
-  const current = (found && found.parentId !== null && found.parentId !== undefined)
-    ? String(found.parentId) : '';
-
-  const options = collectionMoveTargets(collectionTreeForRender, node.id)
-    .map(target => {
-      const selected = target.id === current ? ' selected' : '';
-      return `<option value="${escapeHtml(target.id)}"${selected}>${escapeHtml(target.label)}</option>`;
-    })
-    .join('');
-
-  return `<select class="collection-rename collection-move" id="collection-move-${escapeHtml(node.id)}" data-action="collection-edit-field" draggable="false" aria-label="Move to">${options}</select>`;
-}
 
 function renderCollectionName(node, cssClass) {
   if (editingCollectionNodeId === String(node.id)) {
-    if (editingCollectionMode === 'move') return renderCollectionMoveSelect(node);
-
     // data-action on the field matters: it lives inside a clickable row, and
     // without its own action a click into it would be read as a click on the
     // row underneath — which on a link chip means opening the link.
@@ -2424,7 +2552,7 @@ function renderCollectionRowActions(node) {
     : '';
 
   return `<span class="collection-row-actions">
-      ${addHere}<button class="collection-action" type="button" draggable="false" data-action="move-collection-node" data-node-id="${id}" title="Move to another group">${ICONS.move}</button><button class="collection-action" type="button" draggable="false" data-action="rename-collection-node" data-node-id="${id}" title="Rename">${ICONS.pencil}</button><button class="collection-action is-danger" type="button" draggable="false" data-action="delete-collection-node" data-node-id="${id}" title="Delete">${ICONS.trash}</button>
+      ${addHere}<button class="collection-action" type="button" draggable="false" data-action="rename-collection-node" data-node-id="${id}" title="Rename">${ICONS.pencil}</button><button class="collection-action is-danger" type="button" draggable="false" data-action="delete-collection-node" data-node-id="${id}" title="Delete">${ICONS.trash}</button>
     </span>`;
 }
 
@@ -2487,7 +2615,10 @@ function renderCollectionGroupNode(node, depth, accentColor, columns) {
   const span    = onBoard ? Math.min(normalizeCollectionSpan(node.span), columns) : 1;
 
   const spanAttr = onBoard ? ` style="--card-span:${span}" data-span="${span}"` : '';
-  const dragAttr = onBoard ? ' draggable="true"' : '';
+
+  // Every node drags — a chip or a nested card is just as likely to need
+  // moving as a board card is.
+  const dragAttr = ' draggable="true"';
   // draggable="false" on the handle and the buttons below stops them from
   // starting a card drag: the drag looks for the nearest draggable ancestor, so
   // without this, grabbing a button would pick the card up instead.
@@ -2605,18 +2736,25 @@ function collectionItemIcon(node) {
 /** Notes and snippets carry a body; a link doesn't. */
 function renderCollectionBody(node) {
   const isCode  = node.type === 'snippet';
-  const editing = editingCollectionNodeId === String(node.id) &&
-                  editingCollectionMode === 'rename';
+  const editing = editingCollectionNodeId === String(node.id);
 
   // For a note or a snippet the body IS the thing, so editing one has to
   // reach the text — editing an incidental name instead, while the content
   // sits there untouchable, is the wrong end of the entry.
   if (editing && (node.type === 'note' || isCode)) {
-    return `<textarea class="collection-body-edit${isCode ? ' is-code' : ''}" id="collection-body-${escapeHtml(node.id)}" rows="${isCode ? 4 : 3}" spellcheck="false" aria-label="${isCode ? 'Code' : 'Note'}" data-action="collection-edit-field" draggable="false">${escapeHtml(bodyDraft)}</textarea>`;
+    const field = `<textarea class="collection-body-edit${isCode ? ' is-code' : ''}" id="collection-body-${escapeHtml(node.id)}" rows="${isCode ? 4 : 3}" spellcheck="false" aria-label="${isCode ? 'Code' : 'Note'}" data-action="collection-edit-field" draggable="false">${escapeHtml(bodyDraft)}</textarea>`;
+
+    // A note is written in Markdown, so it needs seeing as it will land —
+    // written syntax that renders wrong is otherwise only visible after you
+    // have already left the editor.
+    const preview = isCode ? '' :
+      `<div class="collection-note collection-body-preview" id="collection-preview-${escapeHtml(node.id)}">${renderNoteMarkdown(bodyDraft)}</div>`;
+
+    return `<div class="collection-body-editor">${field}${preview}</div>`;
   }
 
   if (node.type === 'note') {
-    return `<div class="collection-note">${escapeHtml(node.text)}</div>`;
+    return `<div class="collection-note">${renderNoteMarkdown(node.text)}</div>`;
   }
 
   if (isCode) {
@@ -2646,7 +2784,10 @@ function renderCollectionItemChip(node, depth) {
                       : ' data-action="copy-collection-node"';
   const hint   = href || value || displayCollectionName(node);
 
-  return `<div class="page-chip ${href ? 'clickable' : 'is-copyable'}${confirming}"${action} data-node-id="${escapeHtml(node.id)}" data-node-type="${escapeHtml(node.type)}" data-depth="${depth}" title="${escapeHtml(hint)}">
+  // Chips drag as well as cards do — a note or a link is the most likely thing
+  // to want to move, and since the "Move to…" button is gone, dragging is now
+  // the only way to move one between groups.
+  return `<div class="page-chip ${href ? 'clickable' : 'is-copyable'}${confirming}"${action} draggable="true" data-node-id="${escapeHtml(node.id)}" data-node-type="${escapeHtml(node.type)}" data-depth="${depth}" title="${escapeHtml(hint)}">
       ${collectionItemIcon(node)}
       <div class="collection-item-main">
         ${renderCollectionName(node, 'chip-text')}
@@ -2791,19 +2932,13 @@ function layoutCollectionBoard() {
 function restoreCollectionRenameFocus() {
   if (!editingCollectionNodeId) return;
 
-  let fieldId;
+  const found   = findCollectionNode(collectionTreeForRender, editingCollectionNodeId);
+  const hasBody = !!(found && (found.node.type === 'note' || found.node.type === 'snippet'));
 
-  if (editingCollectionMode === 'move') {
-    fieldId = `collection-move-${editingCollectionNodeId}`;
-  } else {
-    const found   = findCollectionNode(collectionTreeForRender, editingCollectionNodeId);
-    const hasBody = !!(found && (found.node.type === 'note' || found.node.type === 'snippet'));
-
-    // Focus what you opened the editor to change: a note's own text, anything
-    // else's name.
-    fieldId = hasBody ? `collection-body-${editingCollectionNodeId}`
-                      : `collection-rename-${editingCollectionNodeId}`;
-  }
+  // Focus what you opened the editor to change: a note's own text, anything
+  // else's name.
+  const fieldId = hasBody ? `collection-body-${editingCollectionNodeId}`
+                          : `collection-rename-${editingCollectionNodeId}`;
 
   const field = document.getElementById(fieldId);
   if (!field || typeof field.focus !== 'function') return;
@@ -2828,15 +2963,14 @@ function isCollectionBodyField(el) {
 /**
  * isFieldOfCollectionNode(el, nodeId)
  *
- * True for any of the fields belonging to one node's editor. A note is edited
- * by TWO fields at once — its name and its text — so moving between them must
- * not read as leaving the editor and commit it shut.
+ * True for either field of one node's editor. A note is edited by TWO fields at
+ * once — its name and its text — so moving between them must not read as
+ * leaving the editor and commit it shut.
  */
 function isFieldOfCollectionNode(el, nodeId) {
   if (!el || !nodeId) return false;
   return String(el.id) === `collection-rename-${nodeId}` ||
-         String(el.id) === `collection-body-${nodeId}` ||
-         String(el.id) === `${COLLECTION_MOVE_PREFIX}${nodeId}`;
+         String(el.id) === `collection-body-${nodeId}`;
 }
 
 
@@ -2848,23 +2982,15 @@ function isFieldOfCollectionNode(el, nodeId) {
    keeps each button unambiguous no matter how the row markup is nested.
    ---------------------------------------------------------------- */
 
-const COLLECTION_MOVE_PREFIX = 'collection-move-';
-
-function isCollectionMoveField(el) {
-  return !!(el && typeof el.id === 'string' && el.id.startsWith(COLLECTION_MOVE_PREFIX));
-}
 
 /**
  * finishPendingCollectionEdit()
  *
- * Called before opening a different editor. A rename in progress is committed —
- * that's what clicking away from it normally does — while a move in progress is
- * simply dropped, since there's nothing half-typed to keep.
+ * Called before opening a different editor. An edit in progress is committed —
+ * that's what clicking away from it normally does.
  */
 async function finishPendingCollectionEdit() {
-  if (!editingCollectionNodeId) return;
-  if (editingCollectionMode === 'rename') await commitCollectionRename();
-  else cancelCollectionRename();
+  if (editingCollectionNodeId) await commitCollectionRename();
 }
 
 async function beginCollectionRename(id) {
@@ -2882,7 +3008,6 @@ async function beginCollectionRename(id) {
 
   pendingDeleteId = null;
   editingCollectionNodeId = nodeId;
-  editingCollectionMode = 'rename';
   renameDraft = found.node.name || '';
   bodyDraft   = (found.node.type === 'note' || found.node.type === 'snippet')
     ? collectionNodeValue(found.node)     // a note's text, a snippet's code
@@ -2894,79 +3019,11 @@ async function beginCollectionRename(id) {
   restoreCollectionRenameFocus();
 }
 
-/**
- * beginCollectionMove(id)
- *
- * Opens the "move to" select in place of the node's name. Reuses the rename
- * machinery deliberately: same slot, same session token, same single editor
- * at a time — only the control and the commit differ.
- */
-async function beginCollectionMove(id) {
-  const nodeId = String(id || '');
-  if (!nodeId) return;
 
-  await finishPendingCollectionEdit();
-
-  const tree  = await getCollections();
-  const found = findCollectionNode(tree, nodeId);
-  if (!found) {
-    await renderCollectionSection();
-    return;
-  }
-
-  // Only "Top level" on offer, and it's already there
-  if (collectionMoveTargets(tree, nodeId).length === 1 && found.parentId === null) {
-    showToast('There is nowhere else to move that yet');
-    return;
-  }
-
-  pendingDeleteId = null;
-  editingCollectionNodeId = nodeId;
-  editingCollectionMode = 'move';
-  renameDraft = '';
-  renameCaret = null;
-  renameSession++;
-
-  await renderCollectionSection();
-}
-
-/**
- * commitCollectionReparent(nodeId, parentId)
- *
- * Applies a "move to" choice. A pick that resolves to where the node already
- * is changes nothing and — because reparentCollectionNode returns the same
- * tree — writes nothing and says nothing.
- */
-async function commitCollectionReparent(nodeId, parentId) {
-  renameSession++;                 // any focusout still in flight is now stale
-  editingCollectionNodeId = null;
-  editingCollectionMode = 'rename';
-  renameDraft = '';
-  renameCaret = null;
-
-  noteSelfMutation();
-
-  let moved = false;
-  await queueCollectionWrite(tree => {
-    const next = reparentCollectionNode(tree, nodeId, parentId);
-    if (!next || next === tree) return tree;
-    moved = true;
-    return next;
-  });
-
-  if (moved) {
-    const tree = await getCollections();
-    const path = parentId ? collectionPathOf(tree, parentId) : '';
-    showToast(path ? `Moved into ${path}` : 'Moved to the top level');
-  }
-
-  await renderCollectionSection();
-}
 
 async function commitCollectionRename() {
   const id = editingCollectionNodeId;
   if (!id) return;
-  if (editingCollectionMode !== 'rename') return;   // a move has nothing half-typed
 
   const draft = renameDraft.trim();
   const body  = bodyDraft;
@@ -3012,7 +3069,6 @@ function cancelCollectionRename() {
 
   renameSession++;                 // discard any focusout still in flight
   editingCollectionNodeId = null;
-  editingCollectionMode = 'rename';
   renameDraft = '';
   bodyDraft   = '';
   renameCaret = null;
@@ -3029,17 +3085,13 @@ function cancelCollectionRename() {
 function syncCollectionToolbar() {
   const kindEl  = document.getElementById('collectKindSelect');
   const valueEl = document.getElementById('collectUrlInput');
-  const langEl  = document.getElementById('collectLanguageInput');
 
   const kind = kindEl ? String(kindEl.value || 'link') : 'link';
 
-  // The language only means anything for a snippet
-  if (langEl && langEl.style) langEl.style.display = kind === 'snippet' ? '' : 'none';
-
   if (valueEl) {
-    valueEl.placeholder = kind === 'note'    ? 'Write a note…'
-                        : kind === 'snippet' ? 'Paste the code or command…'
-                        : 'Paste a link, or a path…';
+    valueEl.placeholder = kind === 'note'
+      ? 'Write a note — Markdown, and you can paste an image'
+      : 'Paste a link, or a path…';
   }
 }
 
@@ -3058,7 +3110,6 @@ async function addCollectedFromToolbar() {
   const kindEl  = document.getElementById('collectKindSelect');
   const valueEl = document.getElementById('collectUrlInput');
   const nameEl  = document.getElementById('collectNameInput');
-  const langEl  = document.getElementById('collectLanguageInput');
   if (!valueEl) return;
 
   const kind  = kindEl ? String(kindEl.value || 'link') : 'link';
@@ -3068,8 +3119,7 @@ async function addCollectedFromToolbar() {
     return;
   }
 
-  const name     = nameEl ? String(nameEl.value || '').trim() : '';
-  const language = langEl ? String(langEl.value || '').trim() : '';
+  const name = nameEl ? String(nameEl.value || '').trim() : '';
 
   // collectTargetId, not the select's DOM value: the render WRITES that
   // element from this variable, so reading it back would make the element a
@@ -3109,9 +3159,7 @@ async function addCollectedFromToolbar() {
 
       const result = kind === 'note'
         ? addCollectionNote(next, Object.assign({ text: line }, shared))
-        : kind === 'snippet'
-          ? addCollectionSnippet(next, Object.assign({ code: line, language }, shared))
-          : addCollectionLink(next, Object.assign({ url: line }, shared));
+        : addCollectionLink(next, Object.assign({ url: line }, shared));
 
       if (!result) continue;
       next = result.tree;
@@ -3511,20 +3559,40 @@ async function commitCollectionMove(dragId, targetId, position) {
   return moved;
 }
 
-function markCollectionDropTarget(card, position) {
-  document.querySelectorAll('.collection-card.is-drop-before, .collection-card.is-drop-after').forEach(el => {
-    if (el !== card) el.classList.remove('is-drop-before', 'is-drop-after');
+function markCollectionDropTarget(el, position) {
+  document.querySelectorAll('.is-drop-before, .is-drop-after, .is-drop-into').forEach(node => {
+    if (node !== el) node.classList.remove('is-drop-before', 'is-drop-after', 'is-drop-into');
   });
 
-  card.classList.toggle('is-drop-before', position === 'before');
-  card.classList.toggle('is-drop-after',  position === 'after');
+  el.classList.toggle('is-drop-before', position === 'before');
+  el.classList.toggle('is-drop-after',  position === 'after');
+  el.classList.toggle('is-drop-into',   position === 'inside');
+}
+
+/**
+ * collectionDropPosition(target, clientX, clientY)
+ *
+ * The zone under the pointer, or null when the model would refuse that drop —
+ * a group into its own subtree, a chip "inside" another chip, or a node onto
+ * itself. Asking the model rather than re-deriving the rules here is what
+ * keeps the indicator honest: nothing is shown for a drop that cannot happen.
+ */
+function collectionDropPosition(target, clientX, clientY, dragId) {
+  if (!target || String(target.dataset.nodeId) === String(dragId)) return null;
+
+  const axis = String(target.dataset.depth || '') === '0' ? 'x' : 'y';
+  const position = collectionDropZone(target.getBoundingClientRect(), clientX, clientY, axis);
+
+  return isValidCollectionMove(collectionTreeForRender, dragId, target.dataset.nodeId, position)
+    ? position
+    : null;
 }
 
 function finishCollectionDrag() {
   collectionDragActive = false;
   collectionDragId = null;
-  document.querySelectorAll('.collection-card.is-drop-before, .collection-card.is-drop-after')
-    .forEach(el => el.classList.remove('is-drop-before', 'is-drop-after'));
+  document.querySelectorAll('.is-drop-before, .is-drop-after, .is-drop-into')
+    .forEach(el => el.classList.remove('is-drop-before', 'is-drop-after', 'is-drop-into'));
 }
 
 /** Point new links at a particular group (the "+" on a group row). */
@@ -4214,7 +4282,6 @@ document.addEventListener('click', async (e) => {
   if (action === 'add-collection-here')     { await selectCollectionTarget(actionEl.dataset.nodeId); return; }
   if (action === 'toggle-collection-group') { await toggleCollectionGroup(actionEl.dataset.nodeId);  return; }
   if (action === 'rename-collection-node')  { await beginCollectionRename(actionEl.dataset.nodeId);  return; }
-  if (action === 'move-collection-node')    { await beginCollectionMove(actionEl.dataset.nodeId);    return; }
   if (action === 'copy-collection-node')    { await copyCollectionNode(actionEl.dataset.nodeId);     return; }
   if (action === 'collect-group-tabs')      { await collectGroupIntoCollection(Number(actionEl.dataset.groupId)); return; }
   if (action === 'cycle-collection-status') { await cycleCollectionStatus(actionEl.dataset.nodeId);  return; }
@@ -4250,9 +4317,11 @@ document.addEventListener('input', async (e) => {
     return;
   }
 
-  // Same for a note's text or a snippet's code
+  // Same for a note's text or a snippet's code — plus the live preview, which
+  // is updated on its own rather than by re-rendering the tree behind it.
   if (isCollectionBodyField(e.target)) {
     bodyDraft = e.target.value;
+    refreshNotePreview();
     return;
   }
 
@@ -4284,12 +4353,6 @@ document.addEventListener('change', async (e) => {
     return;
   }
 
-  // The "move to" select commits on choosing — there is nothing half-typed
-  if (isCollectionMoveField(e.target)) {
-    await commitCollectionReparent(
-      e.target.id.slice(COLLECTION_MOVE_PREFIX.length),
-      String(e.target.value || ''));
-  }
 });
 
 // async, and it awaits the commit: the commit writes to storage and re-renders,
@@ -4299,8 +4362,7 @@ document.addEventListener('keydown', async (e) => {
   // Escape closes any of the inline editors; Enter only means something in the
   // single-line name field. In a note's text or a snippet's code it has to
   // insert a newline like it does anywhere else.
-  if (isCollectionRenameField(e.target) || isCollectionMoveField(e.target) ||
-      isCollectionBodyField(e.target)) {
+  if (isCollectionRenameField(e.target) || isCollectionBodyField(e.target)) {
     if (e.key === 'Escape') {
       e.preventDefault();
       cancelCollectionRename();
@@ -4316,7 +4378,7 @@ document.addEventListener('keydown', async (e) => {
   // Enter in either toolbar field adds the link, so filing several in a row
   // never needs the mouse
   if (e.key === 'Enter' && e.target.id !== 'collectTargetSelect' && e.target.id !== 'collectKindSelect' &&
-      (e.target.id === 'collectUrlInput' || e.target.id === 'collectNameInput' || e.target.id === 'collectLanguageInput')) {
+      (e.target.id === 'collectUrlInput' || e.target.id === 'collectNameInput')) {
     e.preventDefault();
     await addCollectedFromToolbar();
   }
@@ -4326,25 +4388,15 @@ document.addEventListener('focusout', async (e) => {
   // Moving between the fields of the SAME editor isn't leaving it
   if (isFieldOfCollectionNode(e.relatedTarget, editingCollectionNodeId)) return;
 
-  // Leaving the "move to" select without choosing just closes it
-  if (isCollectionMoveField(e.target)) {
-    if (String(e.target.id) === `${COLLECTION_MOVE_PREFIX}${editingCollectionNodeId}`) {
-      cancelCollectionRename();
-    }
-    return;
-  }
-
   // A note's text field commits like its name does
   if (isCollectionBodyField(e.target)) {
-    if (editingCollectionMode === 'rename' &&
-        String(e.target.id) === `collection-body-${editingCollectionNodeId}`) {
+    if (String(e.target.id) === `collection-body-${editingCollectionNodeId}`) {
       await commitCollectionRename();
     }
     return;
   }
 
   if (!isCollectionRenameField(e.target)) return;
-  if (editingCollectionMode !== 'rename') return;
 
   // focusout bubbles, which is why this isn't blur. The session token makes
   // the focusout caused by our own re-render a no-op — without it, committing
@@ -4390,10 +4442,12 @@ if (typeof document !== 'undefined' && document.fonts && document.fonts.ready &&
 
 /* ---- Collected tabs: dragging a card to reorder the board ---- */
 document.addEventListener('dragstart', (e) => {
-  const card = e.target.closest && e.target.closest('.collection-card[data-depth="0"]');
-  if (!card) return;
+  // closest() takes the innermost card, so dragging a nested card's header
+  // picks that card up rather than the one it sits inside.
+  const node = e.target.closest && e.target.closest('[data-node-id]');
+  if (!node) return;
 
-  collectionDragId = String(card.dataset.nodeId);
+  collectionDragId     = String(node.dataset.nodeId);
   collectionDragActive = true;
 
   if (e.dataTransfer) {
@@ -4406,32 +4460,48 @@ document.addEventListener('dragstart', (e) => {
 });
 
 document.addEventListener('dragover', (e) => {
+  // Let an image be dropped onto a note's editor
+  if (isCollectionBodyField(e.target) && e.dataTransfer &&
+      Array.from(e.dataTransfer.types || []).includes('Files')) {
+    e.preventDefault();
+    return;
+  }
+
   if (!collectionDragActive) return;
 
-  const card = e.target.closest && e.target.closest('.collection-card[data-depth="0"]');
-  if (!card || String(card.dataset.nodeId) === collectionDragId) return;
+  const target   = e.target.closest && e.target.closest('[data-node-id]');
+  const position = collectionDropPosition(target, e.clientX, e.clientY, collectionDragId);
+  if (!position) return;
 
   e.preventDefault();                 // this is what makes the drop possible
   if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
 
-  markCollectionDropTarget(card, collectionDropZoneX(card.getBoundingClientRect(), e.clientX));
+  markCollectionDropTarget(target, position);
 });
 
 document.addEventListener('drop', async (e) => {
+  // An image dropped onto a note's editor, same as pasting one
+  if (isCollectionBodyField(e.target)) {
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!file || !String(file.type || '').startsWith('image/')) return;
+
+    e.preventDefault();
+    await insertNoteImage(e.target, file);
+    return;
+  }
+
   if (!collectionDragActive) return;
 
-  const card     = e.target.closest && e.target.closest('.collection-card[data-depth="0"]');
+  const target   = e.target.closest && e.target.closest('[data-node-id]');
   const dragId   = collectionDragId;
-  const position = card
-    ? collectionDropZoneX(card.getBoundingClientRect(), e.clientX)
-    : 'after';
+  const position = collectionDropPosition(target, e.clientX, e.clientY, dragId);
 
   // Clear the indicators before the (async) move, whatever happens next
   finishCollectionDrag();
-  if (!card) return;
+  if (!position) return;
 
   e.preventDefault();
-  await commitCollectionMove(dragId, String(card.dataset.nodeId), position);
+  await commitCollectionMove(dragId, String(target.dataset.nodeId), position);
 });
 
 document.addEventListener('dragend', () => finishCollectionDrag());
@@ -4440,9 +4510,37 @@ document.addEventListener('dragend', () => finishCollectionDrag());
 // Copying a link out of a document or a chat gives the clipboard two flavours,
 // and the plain-text one has usually lost the address. Reading the HTML one
 // back is the only way to recover what the words were pointing at.
-document.addEventListener('paste', (e) => {
+document.addEventListener('paste', async (e) => {
   const target = e.target;
-  if (!target || target.id !== 'collectUrlInput') return;
+  if (!target) return;
+
+  // An image pasted into a note's editor becomes Markdown, since there is no
+  // URL to point at and nowhere else for the bytes to live.
+  if (isCollectionBodyField(target)) {
+    const file = imageFromClipboard(e.clipboardData);
+    if (file) {
+      e.preventDefault();
+      await insertNoteImage(target, file);
+      return;
+    }
+
+    // Otherwise the paste may be a rich hyperlink — and its plain-text flavour
+    // has usually dropped the address, which is exactly what Markdown is for.
+    // Same recovery the link field does.
+    const link = extractFirstHyperlink(
+      e.clipboardData && typeof e.clipboardData.getData === 'function'
+        ? e.clipboardData.getData('text/html')
+        : '');
+
+    if (!link) return;              // ordinary text — the input event handles it
+
+    e.preventDefault();
+    insertNoteText(target, markdownLinkFrom(link));
+    refreshNotePreview();
+    return;
+  }
+
+  if (target.id !== 'collectUrlInput') return;
 
   const kindEl = document.getElementById('collectKindSelect');
   const kind   = kindEl && kindEl.value ? String(kindEl.value) : 'link';

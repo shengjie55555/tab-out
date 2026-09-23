@@ -162,7 +162,17 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false, globals = {} 
     hidden: false,
     getElementById: getEl,
     documentElement: { dataset: {}, setAttribute() {} },
-    createElement: () => makeEl('created'),
+    createElement: (tag) => {
+      const el = makeEl(tag || 'created');
+      // Just enough canvas for the note image path to run: the harness can't
+      // decode or encode anything, so the encoded result is a fixed stub. That
+      // still exercises the wiring — the sizing, the insertion, the preview.
+      if (tag === 'canvas') {
+        el.getContext = () => ({ drawImage() {} });
+        el.toDataURL = () => 'data:image/webp;base64,STUB';
+      }
+      return el;
+    },
     addEventListener(type, fn) { listeners.push({ type, fn }); },
     body: { appendChild() {} },
     querySelector: () => null,
@@ -304,6 +314,7 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false, globals = {} 
     requestAnimationFrame: () => {},
     HTMLImageElement: class HTMLImageElement {},
     navigator: { clipboard: { writeText: async (text) => { calls.copied.push(String(text)); } } },
+    createImageBitmap: async (file) => ({ width: file && file.width || 3200, height: file && file.height || 1800 }),
     Date, Math, JSON, URL, Set, Map, Promise, Object, Array, String, Number, RegExp, Error,
     // Stands in for config.local.js, which index.html loads but nothing tested
     // could previously define

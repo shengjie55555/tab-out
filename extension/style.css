@@ -1484,7 +1484,8 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   background: var(--card-bg);
 }
 
-.collection-board > .collection-card[draggable="true"] {
+/* Any card drags — reordering works one level in too, not just on the board */
+.collection-card[draggable="true"] {
   cursor: grab;
 }
 
@@ -1728,10 +1729,12 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   box-shadow: 0 0 0 2px rgb(var(--rgb-slate) / 0.15);
 }
 
-/* The "move to" select borrows the rename field's slot and metrics */
-.collection-move {
-  max-width: 320px;
-  cursor: pointer;
+/* "Drop into this group", as opposed to "drop between these two". A different
+   colour from the before/after line, because they do different things. */
+.collection-card.is-drop-into {
+  outline: 2px solid var(--accent-sage);
+  outline-offset: -2px;
+  background: rgb(var(--rgb-sage) / 0.07);
 }
 
 .collection-empty {
@@ -1776,15 +1779,71 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   cursor: copy;
 }
 
+/* A note renders as Markdown and shows in full. The four-line clamp this used
+   to have is gone: a note you can only read four lines of isn't much of a
+   note, and the board measures tile heights, so a long one just makes its
+   card taller. */
 .collection-note {
   font-size: 12px;
   color: var(--ink-soft);
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
-  display: -webkit-box;
-  -webkit-line-clamp: 4;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+}
+
+.collection-note p { margin: 0 0 4px; }
+.collection-note > :last-child { margin-bottom: 0; }
+
+.collection-note ul,
+.collection-note ol {
+  margin: 2px 0 4px;
+  padding-left: 18px;
+}
+
+.collection-note li { margin: 1px 0; }
+
+.collection-note strong {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.collection-note a {
+  color: var(--accent-slate);
+  text-decoration: none;
+}
+
+.collection-note a:hover { text-decoration: underline; }
+
+.collection-note code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  background: rgb(var(--rgb-ink) / 0.05);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+
+/* An embedded image. Pasted screenshots have no URL to point at and there is
+   nowhere else for the bytes to live, so they are stored in the note. */
+.note-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 6px 0;
+  border: 1px solid var(--warm-gray);
+  border-radius: 6px;
+}
+
+.collection-body-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+/* Under the editor while a note is being written, so Markdown that renders
+   wrong is visible before you leave the field rather than after. */
+.collection-body-preview {
+  padding: 5px 7px;
+  border: 1px dashed var(--warm-gray);
+  border-radius: 4px;
 }
 
 .collection-snippet {
