@@ -48,7 +48,7 @@
 
   <!-- ================================================================
        MAIN CONTENT AREA — two-column layout
-       Left: open tabs (domain/mission cards)
+       Left: open tabs, one card per Chrome tab group
        Right: saved for later checklist
        The right column only renders when it has items (JS controls this)
        ================================================================ -->
@@ -57,7 +57,7 @@
     <!-- LEFT COLUMN: Open tabs -->
     <div class="active-section" id="openTabsSection" style="display:none">
       <div class="section-header">
-        <h2 id="openTabsSectionTitle">Right now</h2>
+        <h2 id="openTabsSectionTitle">Open tabs</h2>
         <div class="section-line"></div>
         <div class="section-count" id="openTabsSectionCount"></div>
       </div>
@@ -72,7 +72,7 @@
         <div class="section-count" id="deferredCount"></div>
       </div>
 
-      <!-- Active checklist items — injected by renderDeferredList() in app.js -->
+      <!-- Active checklist items — injected by renderDeferredColumn() in app.js -->
       <div class="deferred-list" id="deferredList"></div>
 
       <!-- Empty state — shown when no active deferred tabs -->
@@ -125,9 +125,12 @@
   <span id="toastText"></span>
 </div>
 
-<!-- Personal config (gitignored) — defines LOCAL_LANDING_PAGE_PATTERNS etc. -->
-<!-- If the file doesn't exist, that's fine — app.js uses sensible defaults. -->
-<script src="config.local.js" onerror="/* no personal config, that's fine */"></script>
+<!-- Personal config (gitignored) — an extension point for personal preferences.
+     Nothing reads it at the moment: grouping now mirrors Chrome's own tab
+     groups, which retired the LOCAL_LANDING_PAGE_PATTERNS and
+     LOCAL_CUSTOM_GROUPS arrays that used to live here.
+     If the file doesn't exist, that's fine — nothing depends on it. -->
+<script src="config.local.js"></script>
 
 <!-- Main dashboard logic — loads last so the DOM is ready -->
 <script src="app.js"></script>

@@ -8,16 +8,18 @@ You're installing **Tab Out** for the user. Your job is not just to set it up --
 
 Before doing anything technical, tell the user what they're about to get:
 
-> **Tab Out** replaces your new tab page with a clean dashboard of everything you have open, grouped by domain.
+> **Tab Out** replaces your new tab page with a clean dashboard of everything you have open, laid out as one card per Chrome tab group.
 >
 > Here's what makes it great:
-> - **See all your open tabs at a glance** grouped by domain on a grid
-> - **Homepages group** pulls Gmail, X, LinkedIn, YouTube, GitHub homepages into one card for easy cleanup
+> - **See all your open tabs at a glance** — one card per Chrome tab group, in your tab strip's own order
+> - **Mirrors your Chrome tab groups** — each card takes its group's name and color, and everything you haven't grouped shares one card at the end
+> - **Collapse from here** — collapse a card and the group collapses in Chrome too
+> - **Stays current** — tabs you open, close or regroup show up right away; there's nothing to refresh
 > - **Close tabs with style** satisfying swoosh sound + confetti burst
 > - **Duplicate detection** flags when you have the same page open twice
 > - **Click any tab title to jump to it** even across different Chrome windows
 > - **Save for later** bookmark individual tabs to a checklist before closing them
-> - **100% local** no server, no accounts, no data sent anywhere
+> - **Your tab data stays local** no server, no accounts; titles and icons come straight from Chrome
 >
 > It's just a Chrome extension. Setup takes about 1 minute.
 
@@ -76,11 +78,11 @@ Once the extension is loaded:
 > You're all set! Open a **new tab** and you'll see Tab Out.
 >
 > Here's how it works:
-> 1. **Your open tabs are grouped by domain** in a grid layout.
-> 2. **Homepages** (Gmail inbox, X home, YouTube, etc.) are in their own group at the top.
+> 1. **Every Chrome tab group gets its own card**, in your tab strip's order. Tabs you haven't grouped share one "Ungrouped" card at the end.
+> 2. **Each card wears its group's name and color** — rename or recolor the group in Chrome and the card follows.
 > 3. **Click any tab title** to jump directly to that tab.
 > 4. **Click the X** next to any tab to close just that one (with swoosh + confetti).
-> 5. **Click "Close all N tabs"** on a group to close the whole thing.
+> 5. **Click "Close all N tabs"** on a card to close just that group. Or hit the arrow next to the name to collapse the group — in Chrome as well as here.
 > 6. **Duplicate tabs** are flagged with an amber "(2x)" badge. Click "Close duplicates" to keep one copy.
 > 7. **Save a tab for later** by clicking the bookmark icon before closing it. Saved tabs appear in the sidebar.
 >
@@ -90,7 +92,8 @@ Once the extension is loaded:
 
 ## Key Facts
 
-- Tab Out is a pure Chrome extension. No server, no Node.js, no npm.
+- Tab Out is a pure Chrome extension. No server, no build step, no dependencies to install.
+- `npm test` (plain Node, no install needed) runs the dashboard's grouping and tab-closing tests.
 - Saved tabs are stored in `chrome.storage.local` (persists across sessions).
-- 100% local. No data is sent to any external service.
+- Your tab data stays local: no server, no accounts, no analytics, and no third-party requests for titles or icons — they come from `chrome.tabs` / `chrome.tabGroups`. (The page does load its fonts from Google Fonts.)
 - To update: `cd tab-out && git pull`, then reload the extension in `chrome://extensions`.

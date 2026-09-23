@@ -4,5 +4,7 @@ node_modules/
 .DS_Store
 docs/superpowers/
 
-# Personal config (landing page patterns, etc.) — never push to GitHub
+# Personal config — an extension point for personal preferences. Nothing reads
+# it today (grouping mirrors Chrome's own tab groups), but keep it ignored so a
+# personal file never gets pushed to GitHub.
 extension/config.local.js

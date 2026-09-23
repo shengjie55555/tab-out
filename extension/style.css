@@ -1,7 +1,5 @@
 /* ============================================================
-   Tab Mission Control — Dashboard Styles
-   Extracted directly from mockup.html — do not modify unless
-   also updating the mockup. This is the approved design.
+   Tab Out — Dashboard Styles
    ============================================================ */
 
 :root {
@@ -18,6 +16,18 @@
   --status-abandoned: #b35a5a;
   --card-bg: #fffdf9;
   --shadow: rgba(26, 22, 19, 0.06);
+
+  /* Chrome's nine tab-group colors, muted to sit on the warm paper palette.
+     Five of them reuse a token above rather than inventing a near-duplicate. */
+  --group-grey:   #9a918a;   /* = --muted */
+  --group-blue:   #5a6b7a;   /* = --accent-slate */
+  --group-red:    #b35a5a;   /* = --accent-rose */
+  --group-yellow: #b8892e;   /* = --status-cooling */
+  --group-green:  #5a7a62;   /* = --accent-sage */
+  --group-pink:   #b07a8a;
+  --group-purple: #7a6b9a;
+  --group-cyan:   #5a8a8a;
+  --group-orange: #c8713a;   /* = --accent-amber */
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -239,7 +249,8 @@ header {
   margin-bottom: 12px;       /* vertical spacing (replaces grid gap) */
 }
 
-/* Colored top border instead of side bar for grid cards */
+/* Colored top border instead of side bar. Its color is the Chrome tab
+   group's own color — set per card from the data-group-color attribute. */
 .mission-card::before {
   content: '';
   position: absolute;
@@ -247,12 +258,21 @@ header {
   left: 0;
   right: 0;
   height: 3px;
-  background: var(--warm-gray);
+  background: var(--card-accent, var(--warm-gray));
 }
 
-.mission-card.has-active-bar::before { background: var(--status-active); }
-.mission-card.has-amber-bar::before { background: var(--accent-amber); }
-.mission-card.has-neutral-bar::before { background: var(--warm-gray); }
+/* Chrome's group colors → muted palette. The attribute value is always
+   whitelisted in app.js (GROUP_COLORS) before it's emitted, so an
+   unrecognized color falls back to grey rather than reaching this table. */
+.mission-card[data-group-color="grey"]   { --card-accent: var(--group-grey); }
+.mission-card[data-group-color="blue"]   { --card-accent: var(--group-blue); }
+.mission-card[data-group-color="red"]    { --card-accent: var(--group-red); }
+.mission-card[data-group-color="yellow"] { --card-accent: var(--group-yellow); }
+.mission-card[data-group-color="green"]  { --card-accent: var(--group-green); }
+.mission-card[data-group-color="pink"]   { --card-accent: var(--group-pink); }
+.mission-card[data-group-color="purple"] { --card-accent: var(--group-purple); }
+.mission-card[data-group-color="cyan"]   { --card-accent: var(--group-cyan); }
+.mission-card[data-group-color="orange"] { --card-accent: var(--group-orange); }
 
 .mission-card:hover {
   box-shadow: 0 4px 20px var(--shadow);
@@ -267,22 +287,15 @@ header {
   pointer-events: none;
 }
 
-.mission-card.collapsed {
-  display: none !important;
-}
-
-/* Old side status bar — hidden, replaced by top border via ::before */
-.status-bar {
+/* A group that Chrome has collapsed hides its tabs here too — but keeps its
+   tab count and its "Close all" button, because a collapsed group is still
+   something you want to be able to close in one go. */
+.mission-card.is-collapsed .mission-pages {
   display: none;
 }
 
 .mission-content {
   min-width: 0;
-}
-
-/* Hide the right-side meta (page count) — info is already in the badge */
-.mission-meta {
-  display: none;
 }
 
 .mission-top {
@@ -291,6 +304,36 @@ header {
   gap: 10px;
   margin-bottom: 6px;
   flex-wrap: wrap;
+}
+
+/* Collapse/expand toggle — writes through to the real Chrome group */
+.card-collapse-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  padding: 2px;
+  cursor: pointer;
+  color: var(--muted);
+  border-radius: 4px;
+  flex-shrink: 0;
+  transition: color 0.15s, background 0.15s;
+}
+
+.card-collapse-toggle svg {
+  width: 14px;
+  height: 14px;
+  transition: transform 0.2s;
+}
+
+.card-collapse-toggle:hover {
+  color: var(--ink);
+  background: rgba(26, 22, 19, 0.05);
+}
+
+.mission-card.is-collapsed .card-collapse-toggle svg {
+  transform: rotate(-90deg);
 }
 
 .mission-name {
@@ -384,6 +427,33 @@ header {
   border-radius: 2px;
 }
 
+/* Letter avatar for tabs with no usable favicon. Chrome supplies favIconUrl
+   for most tabs but not all, and a saved tab may have none at all — this
+   stands in for both .chip-favicon and .deferred-favicon, which supply the
+   sizing. */
+.favicon-fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(154, 145, 138, 0.16);
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  text-transform: uppercase;
+  border-radius: 3px;
+}
+
+/* Favicon in the "Saved for later" column (smaller than a chip icon) */
+.deferred-favicon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  border-radius: 2px;
+  vertical-align: -2px;
+  margin-right: 4px;
+}
+
 /* Title text — wraps naturally, no truncation */
 .chip-text {
   flex: 1;
@@ -467,27 +537,10 @@ header {
   padding: 6px 4px;
 }
 
-/* mission-meta hidden — see above */
-
 .mission-time {
   font-size: 12px;
   color: var(--muted);
   margin-bottom: 4px;
-}
-
-.mission-page-count {
-  font-size: 20px;
-  font-family: 'Newsreader', serif;
-  font-weight: 300;
-  color: var(--ink);
-  line-height: 1;
-}
-
-.mission-page-label {
-  font-size: 10px;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 1px;
 }
 
 /* ---- Actions row ---- */
@@ -682,11 +735,6 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
 /* ================================================================
    STATIC DEFAULT VIEW — new elements added for "AI on demand"
    ================================================================ */
-
-/* ---- Neutral status bar (domain-grouped cards, no AI color) ---- */
-.status-bar.neutral {
-  background: var(--warm-gray);
-}
 
 /* ---- "Domain" tag on static domain cards ---- */
 .mission-tag.neutral {
@@ -1119,6 +1167,13 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
 
 .archive-search::placeholder {
   color: var(--muted);
+}
+
+/* Shown when the archive search matches nothing */
+.archive-empty {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 8px 0;
 }
 
 /* Archive items are simpler — just title + domain + date */
