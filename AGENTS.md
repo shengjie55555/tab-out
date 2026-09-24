@@ -19,7 +19,7 @@ Before doing anything technical, tell the user what they're about to get:
 > - **A collected-tabs library** — a nestable tree of links and Markdown notes (images and all), with drag-to-arrange cards
 > - **Duplicate detection** flags when you have the same page open twice
 > - **Click any tab title to jump to it** even across different Chrome windows
-> - **Save for later** bookmark individual tabs to a checklist before closing them
+> - **Save for later** bookmark individual tabs to a checklist before closing them, tick them off as you read, and dig anything back out of the archive
 > - **Light, dark, or follow the system** — the switch sits in the header, and your choice sticks
 > - **Your tab data stays local** no server, no accounts; titles and icons come straight from Chrome
 >
@@ -87,7 +87,7 @@ Once the extension is loaded:
 > 5. **Hit the arrow** next to a card's name to collapse that group — in Chrome as well as here.
 > 6. **"Close all N tabs"** closes the whole group, and asks first: closing several tabs at once takes two clicks. Closing a single tab stays one click.
 > 7. **Duplicate tabs** are flagged with an amber "(2x)" badge. Click "Close duplicates" to keep one copy.
-> 8. **Save a tab for later** by clicking the bookmark icon before closing it. Saved tabs appear in the sidebar.
+> 8. **Save a tab for later** by clicking the bookmark icon before closing it. Saved tabs appear in the sidebar, newest first. Tick one off when you've read it and it drops into the archive underneath — where you can search it, put it back on the checklist, or delete it for good.
 > 9. **Collect a tab** with the folder icon — or a whole group with "Collect" at the right of its action row. Either way the tabs stay open.
 >
 > Then scroll down to **Collected tabs**, the library:

@@ -343,16 +343,22 @@ function loadApp({ degraded = false, noTabGroupsNamespace = false, globals = {} 
 
     const actionEl = makeEl('actionEl');
     actionEl.dataset = Object.assign({ action }, dataset);
+    // The row a button lives in, for handlers that animate it out before
+    // re-rendering. Lazily created so a test can look at it afterwards.
+    let rowEl = null;
     actionEl.closest = (sel) =>
       sel === '[data-action]' ? actionEl :
       sel === '.mission-card' ? cardStub :
-      sel === '.page-chip'    ? makeEl('chip') : null;
+      sel === '.page-chip'    ? makeEl('chip') :
+      sel === '.archive-item' ? (rowEl = rowEl || makeEl('archive-item')) : null;
 
     const clickHandler = listeners.find(l => l.type === 'click').fn;
     await clickHandler({ target: { closest: () => actionEl }, stopPropagation() {} });
     // Exposed so tests can inspect a control the app marked in place (e.g. a
-    // button armed for a confirming second click)
+    // button armed for a confirming second click), or the row an action
+    // animated out
     calls.actionEl = actionEl;
+    calls.rowEl    = rowEl;
     return calls;
   }
 

@@ -1459,6 +1459,170 @@ async function testDeferredColumn() {
 }
 
 /* ================================================================
+   3b. Saved-for-later — order, restore, delete
+   ================================================================ */
+
+/** A saved-tab record shaped like the app's own, for seeding the store. */
+function savedItem(id, title, savedAt, extra) {
+  return Object.assign({
+    id, title, url: `https://${id}.example`, savedAt,
+    completed: false, dismissed: false,
+  }, extra);
+}
+
+/**
+ * seedSavedTabs(app, items)
+ *
+ * Replaces the saved list the way a real change would — through storage — and
+ * waits for the debounced live sync to repaint. Tests about order can't use the
+ * fixture as-is: its two active items share a savedAt, so nothing distinguishes
+ * one ordering rule from another.
+ */
+async function seedSavedTabs(app, items) {
+  await app.sandbox.chrome.storage.local.set({ deferred: items });
+  await wait(400);
+}
+
+async function testSavedForLaterOrder() {
+  section('Saved for later — newest first');
+  const app = await boot();
+
+  await seedSavedTabs(app, [
+    savedItem('old', 'Oldest', '2026-04-01T10:00:00.000Z'),
+    savedItem('new', 'Newest', '2026-04-09T10:00:00.000Z'),
+    savedItem('mid', 'Middle', '2026-04-05T10:00:00.000Z'),
+    savedItem('a-old', 'Archived first', '2026-03-01T10:00:00.000Z',
+      { completed: true, completedAt: '2026-03-02T10:00:00.000Z' }),
+    savedItem('a-new', 'Archived last', '2026-03-01T10:00:00.000Z',
+      { completed: true, completedAt: '2026-04-08T10:00:00.000Z' }),
+  ]);
+
+  // Both lists are append-ordered in storage, so an unsorted render would put
+  // these in exactly the reverse of what's asserted.
+  const checklist = app.els.deferredList.innerHTML;
+  const at = t => checklist.indexOf(t);
+  ok('the checklist puts the most recently saved on top',
+     at('Newest') < at('Middle') && at('Middle') < at('Oldest'),
+     `Newest@${at('Newest')} Middle@${at('Middle')} Oldest@${at('Oldest')}`);
+
+  const archive = app.els.archiveList.innerHTML;
+  const at2 = t => archive.indexOf(t);
+  ok('the archive puts the most recently archived on top',
+     at2('Archived last') < at2('Archived first'),
+     `last@${at2('Archived last')} first@${at2('Archived first')}`);
+}
+
+async function testSavedForLaterRestore() {
+  section('Saved for later — restoring a checked-off item');
+  const app = await boot();
+
+  // Seeded rather than taken from the fixture: the fixture's archived item has
+  // no completedAt, so asserting the restore drops one would pass either way.
+  await seedSavedTabs(app, [
+    savedItem('older', 'Older pending', '2026-04-01T10:00:00.000Z'),
+    savedItem('newer', 'Newer pending', '2026-04-09T10:00:00.000Z'),
+    savedItem('back', 'Wants another look', '2026-02-01T10:00:00.000Z',
+      { completed: true, completedAt: '2026-02-02T10:00:00.000Z' }),
+  ]);
+
+  await app.fire('restore-deferred', { deferredId: 'back' });
+
+  const record = app.storage().deferred.find(t => t.id === 'back');
+  eq('the record goes back to unfinished', record.completed, false);
+  ok('the archive date is dropped, so it does not carry one while pending',
+     !('completedAt' in record), JSON.stringify(record));
+  ok('it renders on the checklist again',
+     app.els.deferredList.innerHTML.includes('Wants another look'));
+  ok('...and is gone from the archive',
+     !app.els.archiveList.innerHTML.includes('Wants another look'));
+
+  // It was saved in February, so an unsorted or savedAt-ordered list would put
+  // it last — the point of stamping a fresh savedAt is that it lands first.
+  const list = app.els.deferredList.innerHTML;
+  ok('...at the top, not back in its old chronological slot',
+     list.indexOf('Wants another look') < list.indexOf('Newer pending'),
+     `restored@${list.indexOf('Wants another look')} newest@${list.indexOf('Newer pending')}`);
+  eq('the toast says where it went', app.els.toastText.textContent, 'Back on your checklist');
+}
+
+async function testSavedForLaterDelete() {
+  section('Saved for later — deleting an archived item');
+  const app = await boot();
+
+  const c = await app.fire('delete-deferred', { deferredId: '3' });
+
+  eq('the record is removed outright, not just hidden',
+     app.storage().deferred.length, 2);
+  eq('...with no trace of that id left',
+     app.storage().deferred.filter(t => t.id === '3').length, 0);
+  eq('the toast says so', app.els.toastText.textContent, 'Deleted');
+
+  // The row animates out before the re-render, the way dismissing one does —
+  // so it is still on screen at this instant, and gone a beat later.
+  ok('the row slides out rather than vanishing', c.rowEl.classList.contains('removing'));
+  await wait(400);
+  ok('...and the archive no longer holds it',
+     !app.els.archiveList.innerHTML.includes('Archived'));
+
+  // The checklist's own X stays a dismiss — it hides a record, it doesn't
+  // destroy one. Deleting is offered only where the item has been read.
+  const other = await boot();
+  await other.fire('dismiss-deferred', { deferredId: '1' });
+  eq('dismissing from the checklist still keeps the record',
+     other.storage().deferred.length, 3);
+  eq('...marked dismissed rather than deleted',
+     other.storage().deferred.find(t => t.id === '1').dismissed, true);
+}
+
+/**
+ * Every saved-tab write reads the whole list, changes it and writes it back, so
+ * two that overlap would otherwise each persist a snapshot taken before the
+ * other landed — and the loser's change would be silently gone. Deleting makes
+ * that worse than it used to be: a lost write can bring a record back.
+ */
+async function testSavedForLaterWritesSerialize() {
+  section('Saved for later — overlapping writes don\'t clobber each other');
+  const app = await boot();
+
+  // Fired together, without awaiting the first: this is the interleaving the
+  // write queue exists to prevent.
+  await Promise.all([
+    app.fire('restore-deferred', { deferredId: '3' }),
+    app.fire('dismiss-deferred', { deferredId: '1' }),
+  ]);
+
+  const deferred = app.storage().deferred;
+  eq('the restored item is not put back in the archive by the other write',
+     deferred.find(t => t.id === '3').completed, false);
+  eq('the dismissed item is still dismissed',
+     deferred.find(t => t.id === '1').dismissed, true);
+  eq('...and nothing else was lost', deferred.length, 3);
+}
+
+async function testSavedForLaterArchiveMarkup() {
+  section('Saved for later — archive rows offer both actions, safely');
+  const app = await boot();
+
+  await seedSavedTabs(app, [
+    savedItem('x', 'Row', '2026-04-01T10:00:00.000Z',
+      { completed: true, completedAt: '2026-04-02T10:00:00.000Z' }),
+    savedItem('hostile', 'Hostile id', '2026-04-01T10:00:00.000Z',
+      { url: 'https://hostile.example', completed: true, completedAt: '2026-04-02T10:00:00.000Z',
+        id: '"><img src=x onerror=alert(1)>' }),
+  ]);
+
+  const archive = app.els.archiveList.innerHTML;
+  ok('each archived row offers a restore and a delete',
+     archive.includes('data-action="restore-deferred"') &&
+     archive.includes('data-action="delete-deferred"'));
+  ok('...carrying the id the handler acts on',
+     /data-action="delete-deferred" data-deferred-id="x"/.test(archive));
+  ok('an id containing markup is escaped, not interpolated',
+     !/<img/i.test(archive) && archive.includes('&lt;img src=x onerror=alert(1)&gt;'),
+     archive.slice(0, 300));
+}
+
+/* ================================================================
    4. Destructive actions — driven through the real click handler
    ================================================================ */
 async function testHandlers() {
@@ -1702,6 +1866,11 @@ const SUITES = [
   ['grouping',                  testGrouping],
   ['chips',                     testChips],
   ['saved for later',           testDeferredColumn],
+  ['saved for later: order',    testSavedForLaterOrder],
+  ['saved for later: restore',  testSavedForLaterRestore],
+  ['saved for later: delete',   testSavedForLaterDelete],
+  ['saved for later: writes',   testSavedForLaterWritesSerialize],
+  ['saved for later: markup',   testSavedForLaterArchiveMarkup],
   ['destructive actions',       testHandlers],
   ['degraded mode',             testDegraded],
   ['missing tabGroups namespace', testMissingNamespace],

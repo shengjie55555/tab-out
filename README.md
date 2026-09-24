@@ -33,7 +33,7 @@ The agent will walk you through it. Takes about 1 minute.
 - **Duplicate detection** flags the same page open twice, with one-click cleanup
 - **Batch closes ask first** — closing a whole group, the duplicates or everything takes two clicks. Closing one tab stays one click
 - **Collect a whole group** — file an entire Chrome group into your library as a subtree, leaving the tabs open
-- **Save for later** — bookmark individual tabs to a checklist before closing them
+- **Save for later** — bookmark individual tabs to a checklist before closing them. Tick items off as you read them, and the archive below keeps the lot: searchable, put back on the checklist, or deleted for good
 - **Localhost ports** shown next to localhost tabs, so you can tell your projects apart
 
 ### Collected tabs — a library you build

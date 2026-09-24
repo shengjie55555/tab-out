@@ -1335,6 +1335,49 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   flex-shrink: 0;
 }
 
+/* Restore / delete on an archived row. Visible always, dimmed until hover —
+   the same treatment every other action button in the app gets, so nothing
+   here is hover-only to discover. */
+.archive-action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--muted);
+  opacity: 0.55;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s, opacity 0.15s;
+}
+
+.archive-action svg {
+  width: 13px;
+  height: 13px;
+}
+
+.archive-action:hover {
+  color: var(--ink);
+  background: rgb(var(--rgb-muted) / 0.1);
+  opacity: 1;
+}
+
+.archive-action.is-danger:hover {
+  color: var(--accent-rose);
+  background: rgb(var(--rgb-rose) / 0.1);
+}
+
+/* Deleting an archived row slides it out, the way dismissing one does */
+.archive-item.removing {
+  opacity: 0;
+  transform: translateX(20px);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
 
 /* ================================================================
    COLLECTED TABS — the nestable link library

@@ -270,6 +270,40 @@ async function closeTabOutDupes() {
    ---------------------------------------------------------------- */
 
 /**
+ * queueDeferredWrite(mutate)
+ *
+ * Every saved-tab write goes through here, for the reason queueCollectionWrite()
+ * gives: a read-modify-write that spans an await loses whatever another writer
+ * landed in the gap, because each one persists the whole list. That was merely
+ * annoying while every action only hid a record; now that deleting is one of
+ * them, a lost write can resurrect something the user deleted.
+ *
+ * `mutate` gets the freshly-read list and returns a new one, or null to mean
+ * "nothing to do" (no write, no storage event).
+ *
+ * Callers must call noteSelfMutation() synchronously BEFORE this, so the
+ * suppression window is already open when the onChanged echo arrives — the
+ * echo can beat the promise chain.
+ */
+function queueDeferredWrite(mutate) {
+  const run = deferredWriteChain.then(async () => {
+    const { deferred = [] } = await chrome.storage.local.get('deferred');
+    const next = mutate(deferred);
+    if (!next) return deferred;
+    await chrome.storage.local.set({ deferred: next });
+    return next;
+  });
+
+  // One failed write must not wedge every later write in the chain
+  deferredWriteChain = run.catch(() => {});
+  return run;
+}
+
+// The tail of that chain. Declared here rather than beside the other state so
+// the reasoning above reads with the function it belongs to.
+let deferredWriteChain = Promise.resolve();
+
+/**
  * saveTabForLater(tab)
  *
  * Saves a single tab to the "Saved for Later" list in chrome.storage.local.
@@ -277,8 +311,7 @@ async function closeTabOutDupes() {
  */
 async function saveTabForLater(tab) {
   noteSelfMutation();
-  const { deferred = [] } = await chrome.storage.local.get('deferred');
-  deferred.push({
+  await queueDeferredWrite(deferred => deferred.concat([{
     id:        Date.now().toString(),
     url:       tab.url,
     title:     tab.title,
@@ -289,8 +322,23 @@ async function saveTabForLater(tab) {
     savedAt:   new Date().toISOString(),
     completed: false,
     dismissed: false,
-  });
-  await chrome.storage.local.set({ deferred });
+  }]));
+}
+
+/**
+ * deferredSortTime(item, keys)
+ *
+ * A numeric timestamp for ordering, taken from the first of `keys` that parses.
+ * ISO strings happen to compare correctly as strings, but a record written by
+ * an older version — or edited by hand — may not hold one, and an unreadable
+ * date should sink to the bottom rather than scramble the list with NaN.
+ */
+function deferredSortTime(item, keys) {
+  for (const key of keys) {
+    const ms = Date.parse(item[key] || '');
+    if (Number.isFinite(ms)) return ms;
+  }
+  return 0;
 }
 
 /**
@@ -298,14 +346,20 @@ async function saveTabForLater(tab) {
  *
  * Returns all saved tabs from chrome.storage.local.
  * Filters out dismissed items (those are gone for good).
- * Splits into active (not completed) and archived (completed).
+ * Splits into active (not completed) and archived (completed), each newest
+ * first: what you just saved is what you came here to see, and an append-order
+ * list buries it at the bottom of a column you have to scroll.
  */
 async function getSavedTabs() {
   const { deferred = [] } = await chrome.storage.local.get('deferred');
   const visible = deferred.filter(t => !t.dismissed);
+  const newestFirst = keys => (a, b) => deferredSortTime(b, keys) - deferredSortTime(a, keys);
+
   return {
-    active:   visible.filter(t => !t.completed),
-    archived: visible.filter(t => t.completed),
+    active:   visible.filter(t => !t.completed).sort(newestFirst(['savedAt'])),
+    // An item checked off by an older version may carry no completedAt, so fall
+    // back to when it was saved rather than dropping it at the end.
+    archived: visible.filter(t =>  t.completed).sort(newestFirst(['completedAt', 'savedAt'])),
   };
 }
 
@@ -316,13 +370,12 @@ async function getSavedTabs() {
  */
 async function checkOffSavedTab(id) {
   noteSelfMutation();
-  const { deferred = [] } = await chrome.storage.local.get('deferred');
-  const tab = deferred.find(t => t.id === id);
-  if (tab) {
-    tab.completed = true;
-    tab.completedAt = new Date().toISOString();
-    await chrome.storage.local.set({ deferred });
-  }
+  await queueDeferredWrite(deferred => {
+    if (!deferred.some(t => t.id === id)) return null;
+    return deferred.map(t => t.id === id
+      ? Object.assign({}, t, { completed: true, completedAt: new Date().toISOString() })
+      : t);
+  });
 }
 
 /**
@@ -332,12 +385,51 @@ async function checkOffSavedTab(id) {
  */
 async function dismissSavedTab(id) {
   noteSelfMutation();
-  const { deferred = [] } = await chrome.storage.local.get('deferred');
-  const tab = deferred.find(t => t.id === id);
-  if (tab) {
-    tab.dismissed = true;
-    await chrome.storage.local.set({ deferred });
-  }
+  await queueDeferredWrite(deferred => {
+    if (!deferred.some(t => t.id === id)) return null;
+    return deferred.map(t => t.id === id ? Object.assign({}, t, { dismissed: true }) : t);
+  });
+}
+
+/**
+ * restoreSavedTab(id)
+ *
+ * Puts a checked-off item back on the checklist. It goes back to the TOP of the
+ * list, not to the slot its original savedAt would give it: restoring is a
+ * statement that you mean to read it now, and on a long checklist the old slot
+ * can be below the fold, which makes the button look like it did nothing.
+ *
+ * completedAt is dropped rather than left behind, so the record doesn't carry
+ * an archive date while it sits on the checklist.
+ */
+async function restoreSavedTab(id) {
+  noteSelfMutation();
+  await queueDeferredWrite(deferred => {
+    if (!deferred.some(t => t.id === id)) return null;
+    return deferred.map(t => {
+      if (t.id !== id) return t;
+      const restored = Object.assign({}, t, {
+        completed: false,
+        savedAt:   new Date().toISOString(),
+      });
+      delete restored.completedAt;
+      return restored;
+    });
+  });
+}
+
+/**
+ * deleteSavedTab(id)
+ *
+ * Removes the record for good — the one action in the checklist that can't be
+ * undone from the UI. Only the archive offers it: an archived item has already
+ * been read, so that's where losing one costs the least. The checklist's own X
+ * still dismisses rather than deletes, so a mis-click up there stays cheap.
+ */
+async function deleteSavedTab(id) {
+  noteSelfMutation();
+  await queueDeferredWrite(deferred =>
+    deferred.some(t => t.id === id) ? deferred.filter(t => t.id !== id) : null);
 }
 
 
@@ -1730,6 +1822,7 @@ const ICONS = {
   copy:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 0 1-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H6.75a9.06 9.06 0 0 1 1.5.124m7.5 10.376h3.375c.621 0 1.125-.504 1.125-1.125V11.25c0-4.46-3.243-8.161-7.5-8.876a9.06 9.06 0 0 0-1.5-.124H9.375c-.621 0-1.125.504-1.125 1.125v3.5m7.5 10.375H9.375a1.125 1.125 0 0 1-1.125-1.125v-9.25m12 6.625v-1.875a3.375 3.375 0 0 0-3.375-3.375h-1.5a1.125 1.125 0 0 1-1.125-1.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H9.75" /></svg>`,
   pencil:  `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L10.582 16.07a4.5 4.5 0 0 1-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 0 1 1.13-1.897l8.932-8.931Zm0 0L19.5 7.125" /></svg>`,
   trash:   `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" /></svg>`,
+  undo:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9 15 3 9m0 0 6-6M3 9h12a6 6 0 0 1 0 12h-3" /></svg>`,
 };
 
 // Chrome's TabGroupColor values. Used as a whitelist so a group color is
@@ -2338,8 +2431,12 @@ async function renderDeferredColumn() {
   try {
     const { active, archived } = await getSavedTabs();
 
-    // Hide the entire column if there's nothing to show
+    // Hide the entire column if there's nothing to show. The lists are cleared
+    // rather than just hidden: a row for a record that no longer exists has no
+    // business sitting in the DOM, where the next stray query could find it.
     if (active.length === 0 && archived.length === 0) {
+      setHTML(list, '');
+      setHTML(archiveList, '');
       column.style.display = 'none';
       return;
     }
@@ -2353,6 +2450,7 @@ async function renderDeferredColumn() {
       list.style.display = 'block';
       empty.style.display = 'none';
     } else {
+      setHTML(list, '');
       list.style.display = 'none';
       countEl.textContent = '';
       empty.style.display = 'block';
@@ -2367,6 +2465,7 @@ async function renderDeferredColumn() {
       setHTML(archiveList, renderArchiveResults(archived));
       archiveEl.style.display = 'block';
     } else {
+      setHTML(archiveList, '');
       archiveEl.style.display = 'none';
     }
 
@@ -2429,16 +2528,21 @@ function renderArchiveResults(archived) {
 /**
  * renderArchiveItem(item)
  *
- * Builds HTML for one completed/archived item (simpler: just title + date).
+ * Builds HTML for one completed/archived item: title, when it was archived,
+ * and the two things you can do with it — put it back on the checklist, or
+ * delete it for good.
  */
 function renderArchiveItem(item) {
   const ago = item.completedAt ? timeAgo(item.completedAt) : timeAgo(item.savedAt);
+  const id  = escapeHtml(item.id);
   return `
-    <div class="archive-item">
+    <div class="archive-item" data-deferred-id="${id}">
       <a href="${escapeHtml(item.url)}" target="_blank" rel="noopener" class="archive-item-title" title="${escapeHtml(item.title || item.url)}">
         ${escapeHtml(item.title || item.url)}
       </a>
       <span class="archive-item-date">${escapeHtml(ago)}</span>
+      <button class="archive-action" type="button" data-action="restore-deferred" data-deferred-id="${id}" title="Put back on the checklist">${ICONS.undo}</button>
+      <button class="archive-action is-danger" type="button" data-action="delete-deferred" data-deferred-id="${id}" title="Delete for good">${ICONS.trash}</button>
     </div>`;
 }
 
@@ -4149,6 +4253,41 @@ document.addEventListener('click', async (e) => {
         renderDeferredColumn();
       }, 300);
     }
+    return;
+  }
+
+  // ---- Put a checked-off item back on the checklist ----
+  if (action === 'restore-deferred') {
+    const id = actionEl.dataset.deferredId;
+    if (!id) return;
+
+    await restoreSavedTab(id);
+
+    // No exit animation: the row isn't leaving, it's changing lists, and it
+    // reappears at the top of the checklist rather than where it was.
+    showToast('Back on your checklist');
+    await renderDeferredColumn();
+    return;
+  }
+
+  // ---- Delete an archived item for good ----
+  if (action === 'delete-deferred') {
+    const id = actionEl.dataset.deferredId;
+    if (!id) return;
+
+    await deleteSavedTab(id);
+
+    const item = actionEl.closest('.archive-item');
+    if (item) {
+      item.classList.add('removing');
+      setTimeout(() => {
+        item.remove();
+        renderDeferredColumn();
+      }, 300);
+    } else {
+      await renderDeferredColumn();
+    }
+    showToast('Deleted');
     return;
   }
 
