@@ -1,14 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
-  <!-- Rounded rectangle background in amber -->
-  <rect x="4" y="4" width="120" height="120" rx="24" ry="24" fill="#c8713a"/>
-  <!-- White "M" letter centered -->
-  <text
-    x="64"
-    y="90"
-    font-family="Georgia, serif"
-    font-size="80"
-    font-weight="bold"
-    fill="white"
-    text-anchor="middle"
-  >M</text>
+  <title>Tab Out — stacked browser tabs</title>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="#283d35"/>
+  <rect x="34" y="24" width="64" height="56" rx="9" fill="#93b79d"/>
+  <rect x="25" y="38" width="78" height="56" rx="9" fill="#e59a63"/>
+  <path d="M26 54H29V51Q29 46 34 46H50Q54 46 56 50L58 54H102Q112 54 112 64V94Q112 104 102 104H26Q16 104 16 94V64Q16 54 26 54Z" fill="#f8f5f0"/>
+  <rect x="30" y="69" width="38" height="6" rx="3" fill="#283d35"/>
+  <rect x="30" y="84" width="62" height="6" rx="3" fill="#93b79d"/>
 </svg>
