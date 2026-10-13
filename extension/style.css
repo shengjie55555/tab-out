@@ -127,15 +127,9 @@ body::before {
 .container {
   position: relative;
   z-index: 1;
-  max-width: 960px;
+  width: 100%;
   margin: 0 auto;
-  padding: 48px 32px 80px;
-}
-
-/* When the saved-for-later sidebar is open, expand the container
-   so the tab grid still has room for 2-3 columns */
-.container:has(.dashboard-columns) {
-  max-width: 1300px;
+  padding: 48px clamp(16px, 2vw, 32px) 80px;
 }
 
 /* ---- Header ---- */
@@ -1750,15 +1744,15 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   font-size: 12px;
   line-height: 1.45;
   width: 100%;
-  min-height: 54px;
-  max-height: 240px;
+  min-height: 96px;
   padding: 5px 7px;
   margin-top: 2px;
   border: 1px solid var(--accent-slate);
   border-radius: 4px;
   background: var(--card-bg);
   color: var(--ink);
-  resize: vertical;
+  resize: none;
+  overflow-y: hidden;
 }
 
 .collection-body-edit.is-code {
@@ -1970,4 +1964,3 @@ footer { animation: fadeUp 0.5s ease 0.65s both; }
   width: 13px;
   height: 13px;
 }
-

@@ -2251,6 +2251,7 @@ function insertNoteText(field, text) {
 function refreshNotePreview() {
   const preview = document.getElementById(`collection-preview-${editingCollectionNodeId}`);
   if (preview) setHTML(preview, renderNoteMarkdown(bodyDraft));
+  layoutCollectionBoard();
 }
 
 /** Inserts an image into a note, then repaints the preview. */
@@ -2994,6 +2995,18 @@ async function renderCollectionSection() {
   renderCollectionTargets(tree, selectEl);
 }
 
+/** Fit the editor to both explicit newlines and lines wrapped by its width. */
+function resizeCollectionBodyEditor() {
+  if (!editingCollectionNodeId) return;
+  const field = document.getElementById(`collection-body-${editingCollectionNodeId}`);
+  if (!field || !field.style || !field.scrollHeight) return;
+
+  // Reset before measuring so deleting text can shrink the editor too.
+  field.style.height = 'auto';
+  const borderHeight = field.offsetHeight - field.clientHeight;
+  field.style.height = `${field.scrollHeight + borderHeight}px`;
+}
+
 /**
  * layoutCollectionBoard()
  *
@@ -3007,6 +3020,9 @@ async function renderCollectionSection() {
  * gives the same number back rather than ratcheting.
  */
 function layoutCollectionBoard() {
+  // The textarea must reach its final height before measuring its card.
+  resizeCollectionBodyEditor();
+
   // Every direct child, not just the group cards: a leaf sitting loose at the
   // top level is a board tile too, and without a row span it would sit in an
   // 8px row and overlap its neighbours.
