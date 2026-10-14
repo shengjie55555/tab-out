@@ -1842,7 +1842,55 @@ async function testExpandedStateSurvivesSync() {
      cardHtml.slice(0, 100));
 }
 
+async function testCollectionCardSharing() {
+  section('Collections — share a complete card as Markdown');
+  const app = await boot();
+  const tree = { version: 1, nodes: [{ id: 'share', type: 'group', name: 'Reading [list]', collapsed: true, children: [
+    { id: 'share-link', type: 'link', name: 'An [article]', url: 'https://example.com/a(b)' },
+    { id: 'share-group', type: 'group', name: 'Research', collapsed: true, children: [
+      { id: 'share-note', type: 'note', name: 'Ideas', text: '**Keep bold**\n\n- First\n- Second\n\n![Image](data:image/webp;base64,ABC)' },
+      { id: 'share-code', type: 'snippet', name: 'Example', code: '```\nconst x = 1;', language: 'js' },
+    ] },
+    { id: 'share-path', type: 'link', name: 'Run', url: 'team/run-1' },
+    { id: 'share-unsafe', type: 'link', name: 'Unsafe', url: 'javascript:alert(1)' },
+  ] }] };
+  await app.sandbox.chrome.storage.local.set({ collections: tree });
+  await app.sandbox.renderCollectionSection();
+  ok('a collapsed card still offers its share button',
+     app.els.collectedTree.innerHTML.includes('data-action="share-collection-card" data-node-id="share"'));
+  const before = JSON.stringify(app.storage());
+  await app.fire('share-collection-card', { nodeId: 'share' });
+  const markdown = app.calls.copied[0];
+  eq('one click writes to the clipboard', app.calls.copied.length, 1);
+  ok('the card title is escaped', markdown.startsWith('# Reading \\[list\\]\n'));
+  ok('link labels and parenthesized URLs survive', markdown.includes('- [An \\[article\\]](<https://example.com/a(b)>)'));
+  ok('collapsed nested groups retain their hierarchy', markdown.includes('- **Research**\n\n  - **Ideas**'));
+  ok('note Markdown and images are retained', markdown.includes('    **Keep bold**\n    \n    - First\n    - Second') && markdown.includes('![Image](data:image/webp;base64,ABC)'));
+  ok('code fences cannot be closed by the stored code', markdown.includes('    ````js\n    ```\n    const x = 1;\n    ````'));
+  ok('bare paths are copied as text', markdown.includes('- Run\n\n  ```\n  team/run-1\n  ```'));
+  ok('unsafe URLs never become Markdown links', !markdown.includes('](<javascript:') && markdown.includes('javascript:alert(1)'));
+  eq('sharing does not change stored content', JSON.stringify(app.storage()), before);
+  eq('success is announced', app.els.toastText.textContent, 'Card copied as Markdown');
+
+  await app.fireEvent('input', { target: { id: 'collectionFilterInput', value: 'no matches' } });
+  await app.fire('share-collection-card', { nodeId: 'share' });
+  eq('filters do not truncate exported content', app.calls.copied[0], markdown);
+
+  await app.fire('rename-collection-node', { nodeId: 'share-note' });
+  await app.fireEvent('input', { target: { id: 'collection-body-share-note', value: 'Latest draft' } });
+  await app.fire('share-collection-card', { nodeId: 'share' });
+  ok('an active edit is committed before sharing', app.calls.copied[0].includes('Latest draft'));
+
+  app.sandbox.navigator.clipboard.writeText = async () => { throw new Error('denied'); };
+  await app.fire('share-collection-card', { nodeId: 'share' });
+  eq('clipboard failures show an error', app.els.toastText.textContent, 'Could not copy card');
+  app.sandbox.navigator.clipboard = undefined;
+  await app.fire('share-collection-card', { nodeId: 'share' });
+  eq('missing clipboard is handled', app.els.toastText.textContent, 'The clipboard is not available here');
+}
+
 const SUITES = [
+  ['collection card sharing',   testCollectionCardSharing],
   ['harness',                   testHarnessStore],
   ['collection model',          testCollectionModel],
   ['collection render',         testCollectionRender],

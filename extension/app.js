@@ -1812,6 +1812,7 @@ function smartTitle(title, url) {
    SVG ICON STRINGS
    ---------------------------------------------------------------- */
 const ICONS = {
+  share:   `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M12 16V3m0 0L7 8m5-5 5 5M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6" /></svg>`,
   tabs:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3 8.25V18a2.25 2.25 0 0 0 2.25 2.25h13.5A2.25 2.25 0 0 0 21 18V8.25m-18 0V6a2.25 2.25 0 0 1 2.25-2.25h13.5A2.25 2.25 0 0 1 21 6v2.25m-18 0h18" /></svg>`,
   close:   `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>`,
   chevron: `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" /></svg>`,
@@ -2657,7 +2658,7 @@ function renderCollectionRowActions(node) {
     : '';
 
   return `<span class="collection-row-actions">
-      ${addHere}<button class="collection-action" type="button" draggable="false" data-action="rename-collection-node" data-node-id="${id}" title="Rename">${ICONS.pencil}</button><button class="collection-action is-danger" type="button" draggable="false" data-action="delete-collection-node" data-node-id="${id}" title="Delete">${ICONS.trash}</button>
+      ${addHere}${node.type === 'group' ? `<button class="collection-action" type="button" draggable="false" data-action="share-collection-card" data-node-id="${id}" title="Copy card as Markdown" aria-label="Copy card as Markdown">${ICONS.share}</button>` : ''}<button class="collection-action" type="button" draggable="false" data-action="rename-collection-node" data-node-id="${id}" title="Rename">${ICONS.pencil}</button><button class="collection-action is-danger" type="button" draggable="false" data-action="delete-collection-node" data-node-id="${id}" title="Delete">${ICONS.trash}</button>
     </span>`;
 }
 
@@ -3307,6 +3308,54 @@ async function addCollectedFromToolbar() {
     : `Added ${added}${where}`);
 
   await renderCollectionSection();
+}
+
+/** Export stored content as nested lists, independent of filtering or collapse. */
+function collectionCardMarkdown(node) {
+  const label = value => String(value || '').replace(/\s+/g, ' ').replace(/[\\`*_{}\[\]<>#]/g, '\\$&');
+  const indent = text => String(text).split('\n').map(line => `  ${line}`).join('\n');
+  const fenced = (code, language) => {
+    const runs = String(code || '').match(/`+/g) || [];
+    const fence = '`'.repeat(Math.max(3, ...runs.map(run => run.length + 1)));
+    const lang = /^[a-z0-9_+-]+$/i.test(language || '') ? language : '';
+    return `${fence}${lang}\n${code || ''}\n${fence}`;
+  };
+  function entry(item) {
+    const name = label(displayCollectionName(item));
+    if (item.type === 'group') {
+      const children = (item.children || []).map(entry).join('\n\n');
+      return `- **${name}**${children ? `\n\n${indent(children)}` : ''}`;
+    }
+    if (item.type === 'link') {
+      const href = safeCollectionHref(item.url);
+      const destination = href.replace(/[<>\s]/g, ch => encodeURIComponent(ch));
+      return href ? `- [${name}](<${destination}>)` : `- ${name}\n\n${indent(fenced(item.url, ''))}`;
+    }
+    const body = item.type === 'snippet' ? fenced(item.code, item.language) : item.text || '';
+    const title = (item.name || '').trim() ? label(item.name) : item.type === 'snippet' ? 'Code' : 'Note';
+    return `- **${title}**${body ? `\n\n${indent(body)}` : ''}`;
+  }
+  return `# ${label(displayCollectionName(node))}\n${(node.children || []).length ? `\n${node.children.map(entry).join('\n\n')}\n` : ''}`;
+}
+
+async function shareCollectionCard(nodeId) {
+  try {
+    await finishPendingCollectionEdit();
+    const found = findCollectionNode(await getCollections(), nodeId);
+    if (!found || found.node.type !== 'group') {
+      showToast('That card is already gone');
+      return;
+    }
+    if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) {
+      showToast('The clipboard is not available here');
+      return;
+    }
+    await navigator.clipboard.writeText(collectionCardMarkdown(found.node));
+    showToast('Card copied as Markdown');
+  } catch (err) {
+    console.warn('[tab-out] Could not share the card:', err);
+    showToast('Could not copy card');
+  }
 }
 
 /**
@@ -4438,6 +4487,7 @@ document.addEventListener('click', async (e) => {
   if (action === 'toggle-collection-group') { await toggleCollectionGroup(actionEl.dataset.nodeId);  return; }
   if (action === 'rename-collection-node')  { await beginCollectionRename(actionEl.dataset.nodeId);  return; }
   if (action === 'copy-collection-node')    { await copyCollectionNode(actionEl.dataset.nodeId);     return; }
+  if (action === 'share-collection-card')   { await shareCollectionCard(actionEl.dataset.nodeId);    return; }
   if (action === 'collect-group-tabs')      { await collectGroupIntoCollection(Number(actionEl.dataset.groupId)); return; }
   if (action === 'cycle-collection-status') { await cycleCollectionStatus(actionEl.dataset.nodeId);  return; }
   // The inline edit fields sit inside clickable rows. Giving them their own
