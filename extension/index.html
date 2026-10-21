@@ -40,24 +40,43 @@
          one is always visible: "follow the system" and "happens to look like
          the system right now" are different states. app.js keeps
          aria-pressed and the data-theme attribute in step. -->
-    <div class="theme-switch" role="group" aria-label="Colour theme">
-      <button class="theme-option" type="button" id="themeLight"
-              data-action="set-theme" data-theme-choice="light"
-              title="Light" aria-label="Light" aria-pressed="false">
-        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><circle cx="12" cy="12" r="4" /><path stroke-linecap="round" stroke-linejoin="round" d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>
-      </button>
-      <button class="theme-option" type="button" id="themeSystem"
-              data-action="set-theme" data-theme-choice="system"
-              title="Follow the system" aria-label="Follow the system" aria-pressed="true">
-        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><circle cx="12" cy="12" r="9" /><path d="M12 3a9 9 0 0 1 0 18Z" fill="currentColor" stroke="none" /></svg>
-      </button>
-      <button class="theme-option" type="button" id="themeDark"
-              data-action="set-theme" data-theme-choice="dark"
-              title="Dark" aria-label="Dark" aria-pressed="false">
-        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79Z" /></svg>
-      </button>
+    <div class="header-tools">
+      <button type="button" class="action-btn save-tabs" data-action="backup-all-tabs">Backup all</button>
+      <button type="button" class="action-btn" data-action="restore-tabs">Restore backup</button>
+      <div class="theme-switch" role="group" aria-label="Colour theme">
+        <button class="theme-option" type="button" id="themeLight"
+                data-action="set-theme" data-theme-choice="light"
+                title="Light" aria-label="Light" aria-pressed="false">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><circle cx="12" cy="12" r="4" /><path stroke-linecap="round" stroke-linejoin="round" d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>
+        </button>
+        <button class="theme-option" type="button" id="themeSystem"
+                data-action="set-theme" data-theme-choice="system"
+                title="Follow the system" aria-label="Follow the system" aria-pressed="true">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><circle cx="12" cy="12" r="9" /><path d="M12 3a9 9 0 0 1 0 18Z" fill="currentColor" stroke="none" /></svg>
+        </button>
+        <button class="theme-option" type="button" id="themeDark"
+                data-action="set-theme" data-theme-choice="dark"
+                title="Dark" aria-label="Dark" aria-pressed="false">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79Z" /></svg>
+        </button>
+      </div>
     </div>
   </header>
+  <input id="tabsBackupFile" type="file" accept=".json,application/json" hidden>
+  <dialog id="tabsRestoreDialog" class="tabs-restore-dialog" aria-labelledby="tabsRestoreTitle">
+    <h2 id="tabsRestoreTitle">Restore backup</h2>
+    <p id="tabsRestoreSummary"></p>
+    <div class="restore-options">
+      <label><input type="checkbox" id="restoreOpenTabs" checked> Open tabs and groups in new windows</label>
+      <label><input type="checkbox" id="restoreLibrary" checked> Add collected tabs, notes and saved-for-later items</label>
+    </div>
+    <p id="tabsRestoreStatus" role="status" aria-live="polite"></p>
+    <div class="actions">
+      <button type="button" class="action-btn" id="tabsRestoreCancel" data-action="cancel-tabs-restore">Cancel</button>
+      <button type="button" class="action-btn primary" id="tabsRestoreConfirm" data-action="confirm-tabs-restore">Restore selected</button>
+    </div>
+  </dialog>
+
 
   <!-- ================================================================
        TAB OUT DUPES BANNER — appears when you have extra Tab Out tabs open
@@ -87,7 +106,7 @@
 
     <!-- LEFT COLUMN: Open tabs -->
     <div class="active-section" id="openTabsSection" style="display:none">
-      <div class="section-header">
+      <div class="section-header open-tabs-header">
         <h2 id="openTabsSectionTitle">Open tabs</h2>
         <div class="section-line"></div>
         <div class="section-count" id="openTabsSectionCount"></div>

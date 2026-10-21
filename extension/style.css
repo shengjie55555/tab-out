@@ -137,6 +137,8 @@ header {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 16px;
   margin-bottom: 48px;
   padding-bottom: 24px;
   border-bottom: 1px solid var(--warm-gray);
@@ -335,6 +337,71 @@ header {
   font-weight: 500;
   letter-spacing: 0.5px;
   white-space: nowrap;
+}
+
+.open-tabs-header {
+  flex-wrap: wrap;
+}
+
+.header-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.restore-options {
+  display: grid;
+  gap: 12px;
+  margin: 16px 0;
+  font-size: 13px;
+}
+
+.restore-options label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.restore-options input { margin-top: 3px; }
+
+.open-tabs-header .action-btn {
+  padding: 3px 10px;
+}
+
+.tabs-restore-dialog {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  width: min(440px, calc(100vw - 40px));
+  max-height: calc(100dvh - 40px);
+  overflow-y: auto;
+  box-sizing: border-box;
+  padding: 24px;
+  border: 1px solid var(--warm-gray);
+  border-radius: 12px;
+  background: var(--card-bg);
+  color: var(--ink);
+}
+
+.tabs-restore-dialog[open] {
+  animation: fadeUp 0.3s ease both;
+}
+
+.tabs-restore-dialog::backdrop {
+  background: rgb(0 0 0 / 0.35);
+}
+
+.tabs-restore-dialog p {
+  margin: 12px 0;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.action-btn:disabled {
+  opacity: 0.5;
+  cursor: wait;
 }
 
 /* ---- Mission Cards ---- */

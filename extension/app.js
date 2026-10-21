@@ -101,6 +101,325 @@ async function fetchChromeGroups() {
   }
 }
 
+/* Manual, portable tab snapshots. Never store session IDs as restore targets. */
+const TAB_BACKUP_COLORS = new Set(['grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange']);
+let pendingTabsRestore = null;
+let tabsRestoreRunning = false;
+let tabsBackupRunning = false;
+
+function backupTabUrl(value) {
+  if (typeof value !== 'string' || !value || value.length > 65536) throw new Error('Invalid tab URL');
+  const url = new URL(value);
+  if (!['http:', 'https:', 'file:', 'ftp:', 'chrome:', 'edge:', 'chrome-extension:'].includes(url.protocol) && value !== 'about:blank') {
+    throw new Error('Unsupported tab URL');
+  }
+  return value;
+}
+
+function buildTabsBackup(windows, groups, extensionId, createdAt = new Date().toISOString()) {
+  const snapshot = { format: 'tab-out-tabs', version: 1, createdAt, windows: [] };
+  for (const win of windows) {
+    if (win.type !== 'normal' || win.incognito || !win.tabs || !win.tabs.length) continue;
+    const tabs = [...win.tabs].sort((a, b) => a.index - b.index);
+    const usedGroups = groups.filter(g => g.windowId === win.id && tabs.some(t => t.groupId === g.id));
+    const groupIndexes = new Map(usedGroups.map((g, i) => [g.id, i]));
+    snapshot.windows.push({
+      focused: !!win.focused,
+      groups: usedGroups.map(g => ({ title: g.title || '', color: g.color, collapsed: !!g.collapsed })),
+      tabs: tabs.map(t => {
+        let url = t.pendingUrl || t.url;
+        if (url && (url.startsWith(`chrome-extension://${extensionId}/`) || url === 'edge://newtab/')) url = 'chrome://newtab/';
+        if (Number.isInteger(t.groupId) && t.groupId >= 0 && !groupIndexes.has(t.groupId)) {
+          throw new Error('A tab group changed during backup. Please try again.');
+        }
+        return { url: backupTabUrl(url), title: t.title || '', pinned: !!t.pinned,
+          active: !!t.active, group: groupIndexes.has(t.groupId) ? groupIndexes.get(t.groupId) : null };
+      }),
+    });
+  }
+  return validateTabsBackup(snapshot);
+}
+
+// Validate the entire file before opening even one window. Return only the
+// fields we use; imported data never becomes HTML or arbitrary API options.
+function validateTabsBackup(value) {
+  const invalid = () => { throw new Error('This is not a valid Tab Out tabs backup.'); };
+  if (!value || value.format !== 'tab-out-tabs' || value.version !== 1 ||
+      !Array.isArray(value.windows) || value.windows.length > 100) invalid();
+  let count = 0;
+  const windows = value.windows.map(win => {
+    if (!win || !Array.isArray(win.tabs) || !win.tabs.length || !Array.isArray(win.groups) ||
+        win.groups.length > win.tabs.length || typeof win.focused !== 'boolean') invalid();
+    count += win.tabs.length;
+    if (count > 10000) invalid();
+    const groups = win.groups.map(g => {
+      if (!g || typeof g.title !== 'string' || g.title.length > 4096 ||
+          !TAB_BACKUP_COLORS.has(g.color) || typeof g.collapsed !== 'boolean') invalid();
+      return { title: g.title, color: g.color, collapsed: g.collapsed };
+    });
+    const tabs = win.tabs.map(t => {
+      if (!t || typeof t.title !== 'string' || t.title.length > 65536 || typeof t.pinned !== 'boolean' ||
+          typeof t.active !== 'boolean' || (t.group !== null &&
+          (!Number.isInteger(t.group) || t.group < 0 || t.group >= groups.length || t.pinned))) invalid();
+      return { url: backupTabUrl(t.url), title: t.title, pinned: t.pinned, active: t.active, group: t.group };
+    });
+    // Chrome groups are contiguous, and pinned tabs precede unpinned tabs.
+    let unpinned = false;
+    const ended = new Set();
+    let previous = null;
+    for (const tab of tabs) {
+      if (tab.pinned && unpinned) invalid();
+      if (!tab.pinned) unpinned = true;
+      if (tab.group !== previous) {
+        if (previous !== null) ended.add(previous);
+        if (tab.group !== null && ended.has(tab.group)) invalid();
+        previous = tab.group;
+      }
+    }
+    if (groups.some((g, i) => !tabs.some(t => t.group === i))) invalid();
+    return { focused: win.focused, tabs, groups };
+  });
+  return { format: 'tab-out-tabs', version: 1, createdAt: typeof value.createdAt === 'string' ? value.createdAt : '', windows };
+}
+
+function validateDashboardBackup(value) {
+  if (value && value.format === 'tab-out-tabs') {
+    return { format: 'tab-out-backup', version: 1, openTabs: validateTabsBackup(value), collections: null, deferred: null };
+  }
+  if (!value || !['tab-out-backup', 'tab-out-library'].includes(value.format) || value.version !== 1) {
+    throw new Error('This is not a supported Tab Out backup.');
+  }
+  if (!value.collections || value.collections.version !== 1 || !Array.isArray(value.collections.nodes) || !Array.isArray(value.deferred)) {
+    throw new Error('Invalid library in backup.');
+  }
+  // Reject malformed nodes before the renderer's sanitizer can drop content.
+  const ids = new Set();
+  let total = 0;
+  function check(nodes, depth) {
+    if (depth > MAX_COLLECTION_DEPTH) throw new Error('Library is too deeply nested.');
+    for (const n of nodes) {
+      if (++total > 10000 || !n || typeof n.id !== 'string' || !n.id || ids.has(n.id) ||
+          !COLLECTION_TYPES.has(n.type) || typeof n.name !== 'string') throw new Error('Invalid collected entry.');
+      ids.add(n.id);
+      if (n.type === 'group') {
+        if (!Array.isArray(n.children)) throw new Error('Invalid collection group.');
+        check(n.children, depth + 1);
+      } else if (typeof n[n.type === 'note' ? 'text' : n.type === 'snippet' ? 'code' : 'url'] !== 'string') {
+        throw new Error('Invalid collected content.');
+      }
+    }
+  }
+  check(value.collections.nodes, 0);
+  if (value.deferred.length > 10000 || value.deferred.some(t => !t || typeof t.id !== 'string' ||
+      typeof t.url !== 'string' || typeof t.title !== 'string' || typeof t.savedAt !== 'string')) {
+    throw new Error('Invalid saved-for-later entries.');
+  }
+  return { format: 'tab-out-backup', version: 1, createdAt: value.createdAt || value.exportedAt || '',
+    openTabs: value.format === 'tab-out-library' ? null : validateTabsBackup(value.openTabs),
+    collections: sanitizeCollectionTree(value.collections), deferred: JSON.parse(JSON.stringify(value.deferred)) };
+}
+
+// Imported content is added. Repeated imports skip exact copies even after an
+// ID collision was remapped, while changed copies remain recoverable.
+function mergeBackupCollections(current, imported) {
+  const next = JSON.parse(JSON.stringify(current));
+  const ids = new Set();
+  function scan(nodes) { for (const n of nodes) { ids.add(n.id); if (n.children) scan(n.children); } }
+  scan(next.nodes);
+  function content(node) {
+    const copy = { ...node };
+    delete copy.id;
+    if (copy.children) copy.children = copy.children.map(n => JSON.parse(content(n)));
+    return JSON.stringify(copy);
+  }
+  const known = new Set(next.nodes.map(content));
+  function rekey(node) {
+    const copy = { ...node };
+    let id = copy.id;
+    let suffix = 1;
+    while (ids.has(id)) id = `${copy.id}-import-${suffix++}`;
+    copy.id = id; ids.add(id);
+    if (copy.children) copy.children = copy.children.map(rekey);
+    return copy;
+  }
+  for (const node of imported.nodes) {
+    const signature = content(node);
+    if (known.has(signature)) continue;
+    known.add(signature); next.nodes.push(rekey(node));
+  }
+  return next;
+}
+
+function mergeBackupDeferred(current, imported) {
+  const next = JSON.parse(JSON.stringify(current));
+  const ids = new Set(next.map(t => t.id));
+  const signature = t => JSON.stringify(Object.keys(t).filter(k => k !== 'id').sort().map(k => [k, t[k]]));
+  const known = new Set(next.map(signature));
+  for (const item of imported) {
+    const key = signature(item);
+    if (known.has(key)) continue;
+    const copy = { ...item }; let suffix = 1;
+    while (ids.has(copy.id)) copy.id = `${item.id}-import-${suffix++}`;
+    ids.add(copy.id); known.add(key); next.push(copy);
+  }
+  return next;
+}
+
+async function restoreDashboardLibrary(snapshot) {
+  const stored = await chrome.storage.local.get('collections');
+  if (stored.collections && stored.collections.version > COLLECTIONS_VERSION) {
+    throw new Error('The current library uses a newer format. Update Tab Out before importing.');
+  }
+  noteSelfMutation();
+  await queueCollectionWrite(current => mergeBackupCollections(current, snapshot.collections));
+  await queueDeferredWrite(current => mergeBackupDeferred(current, snapshot.deferred));
+  await renderDashboard();
+}
+
+async function backupAllTabs() {
+  if (tabsBackupRunning) return;
+  tabsBackupRunning = true;
+  try {
+    await Promise.all([collectionsWriteChain, deferredWriteChain]);
+    const [windows, groups, stored] = await Promise.all([
+      chrome.windows.getAll({ populate: true, windowTypes: ['normal'] }),
+      chrome.tabGroups.query({}),
+      chrome.storage.local.get(['collections', 'deferred']),
+    ]);
+    const snapshot = validateDashboardBackup({ format: 'tab-out-backup', version: 1,
+      createdAt: new Date().toISOString(),
+      openTabs: buildTabsBackup(windows, groups, chrome.runtime.id),
+      collections: stored.collections || createEmptyCollectionTree(), deferred: stored.deferred || [] });
+    const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json' });
+    if (blob.size > 20 * 1024 * 1024) throw new Error('Tabs backup exceeds the 20 MB import limit.');
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `tab-out-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    document.body.appendChild(link);
+    try { link.click(); } finally {
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }
+    showToast('Backup download started');
+  } catch (err) {
+    console.warn('[tab-out] Tabs backup failed:', err);
+    showToast('Could not back up tabs. Please try again.');
+  } finally { tabsBackupRunning = false; }
+}
+
+async function prepareTabsRestore(file) {
+  if (!file || tabsRestoreRunning) return;
+  pendingTabsRestore = null;
+  try {
+    if (file.size > 20 * 1024 * 1024) throw new Error('Backup file is too large (maximum 20 MB).');
+    const snapshot = validateDashboardBackup(JSON.parse(await file.text()));
+    pendingTabsRestore = snapshot;
+    const windows = snapshot.openTabs ? snapshot.openTabs.windows : [];
+    const tabs = windows.reduce((n, w) => n + w.tabs.length, 0);
+    const groups = windows.reduce((n, w) => n + w.groups.length, 0);
+    const libraryCount = snapshot.collections ? countCollectionNodes(snapshot.collections) : { groups: 0, items: 0 };
+    document.getElementById('tabsRestoreSummary').textContent =
+      `${tabs} tabs and ${groups} groups in ${windows.length} windows; ${libraryCount.groups} collected groups, ${libraryCount.items} entries and ${(snapshot.deferred || []).length} saved-for-later items. Current data stays in place. Imported entries are added; identical entries are skipped. Pages may ask you to sign in again.`;
+    const tabsOption = document.getElementById('restoreOpenTabs');
+    tabsOption.checked = !!windows.length;
+    tabsOption.disabled = !windows.length;
+    const libraryOption = document.getElementById('restoreLibrary');
+    libraryOption.checked = !!snapshot.collections;
+    libraryOption.disabled = !snapshot.collections;
+    document.getElementById('tabsRestoreStatus').textContent = '';
+    document.getElementById('tabsRestoreConfirm').disabled = false;
+    document.getElementById('tabsRestoreCancel').disabled = false;
+    document.getElementById('tabsRestoreCancel').textContent = 'Cancel';
+    document.getElementById('tabsRestoreDialog').showModal();
+  } catch (err) {
+    pendingTabsRestore = null;
+    showToast(err instanceof SyntaxError ? 'Could not read that JSON backup.' : err.message);
+  }
+}
+
+async function restoreTabsBackup(value, onProgress = () => {}) {
+  const snapshot = validateTabsBackup(value);
+  const result = { tabs: 0, groups: 0, windows: 0, failedTabs: 0, failedGroups: 0 };
+  let focusWindow = null;
+  for (const saved of snapshot.windows) {
+    let win;
+    try { win = await chrome.windows.create({ url: 'about:blank', focused: false, type: 'normal' }); }
+    catch { result.failedTabs += saved.tabs.length; result.failedGroups += saved.groups.length; continue; }
+    result.windows++;
+    const created = new Map();
+    for (let i = 0; i < saved.tabs.length; i++) {
+      const tab = saved.tabs[i];
+      try {
+        const next = await chrome.tabs.create({ windowId: win.id, url: tab.url, pinned: tab.pinned, active: false });
+        created.set(i, next.id);
+        result.tabs++;
+      } catch { result.failedTabs++; }
+      onProgress(result);
+    }
+    if (created.size) {
+      // Only remove the temporary blank tab in the window we just created.
+      try { await chrome.tabs.remove((win.tabs || []).map(t => t.id)); } catch {}
+      const activeIndex = saved.tabs.findIndex(t => t.active);
+      if (created.has(activeIndex)) {
+        try { await chrome.tabs.update(created.get(activeIndex), { active: true }); } catch {}
+      }
+      if (saved.focused) focusWindow = win.id;
+    }
+    for (let i = 0; i < saved.groups.length; i++) {
+      const ids = saved.tabs.flatMap((t, index) => t.group === i && created.has(index) ? [created.get(index)] : []);
+      if (!ids.length) { result.failedGroups++; continue; }
+      try {
+        const groupId = await chrome.tabs.group({ tabIds: ids, createProperties: { windowId: win.id } });
+        await chrome.tabGroups.update(groupId, saved.groups[i]);
+        result.groups++;
+      } catch { result.failedGroups++; }
+    }
+  }
+  if (focusWindow !== null) {
+    try { await chrome.windows.update(focusWindow, { focused: true }); } catch {}
+  }
+  return result;
+}
+
+async function confirmTabsRestore() {
+  if (!pendingTabsRestore || tabsRestoreRunning) return;
+  const withTabs = document.getElementById('restoreOpenTabs').checked;
+  const withLibrary = document.getElementById('restoreLibrary').checked;
+  if (!withTabs && !withLibrary) { showToast('Select something to restore'); return; }
+  tabsRestoreRunning = true;
+  const status = document.getElementById('tabsRestoreStatus');
+  document.getElementById('tabsRestoreConfirm').disabled = true;
+  document.getElementById('tabsRestoreCancel').disabled = true;
+  document.getElementById('restoreOpenTabs').disabled = true;
+  document.getElementById('restoreLibrary').disabled = true;
+  try {
+    const snapshot = pendingTabsRestore;
+    let libraryRestored = false;
+    if (withLibrary && snapshot.collections) {
+      status.textContent = 'Restoring collected tabs and saved-for-later items…';
+      await restoreDashboardLibrary(snapshot);
+      libraryRestored = true;
+    }
+    const result = withTabs && snapshot.openTabs ? await restoreTabsBackup(snapshot.openTabs, r => {
+      status.textContent = `Restoring… ${r.tabs} tabs opened`;
+    }) : { tabs: 0, groups: 0, windows: 0, failedTabs: 0, failedGroups: 0 };
+    status.textContent = `Restored ${result.tabs} tabs and ${result.groups} groups in ${result.windows} windows.` +
+      (libraryRestored ? ' Collected tabs and saved-for-later items restored.' : '') +
+      (result.failedTabs || result.failedGroups ? ` ${result.failedTabs} tabs and ${result.failedGroups} groups could not be restored. Keep your backup file.` : '');
+    pendingTabsRestore = null;
+    showToast('Tab restore finished');
+  } catch (err) {
+    status.textContent = 'Restore stopped. Some items or new windows may already have been restored. Keep your backup file. ' + err.message;
+    pendingTabsRestore = null;
+    console.warn('[tab-out] Tabs restore failed:', err);
+  } finally {
+    tabsRestoreRunning = false;
+    document.getElementById('tabsRestoreCancel').disabled = false;
+    document.getElementById('tabsRestoreCancel').textContent = 'Done';
+  }
+}
+
 /**
  * closeTabsByIds(ids)
  *
@@ -4152,6 +4471,20 @@ document.addEventListener('click', async (e) => {
 
   const action = actionEl.dataset.action;
 
+  if (action === 'backup-all-tabs') { await backupAllTabs(); return; }
+  if (action === 'restore-tabs') {
+    if (!tabsRestoreRunning) document.getElementById('tabsBackupFile').click();
+    return;
+  }
+  if (action === 'confirm-tabs-restore') { await confirmTabsRestore(); return; }
+  if (action === 'cancel-tabs-restore') {
+    if (!tabsRestoreRunning) {
+      pendingTabsRestore = null;
+      document.getElementById('tabsRestoreDialog').close();
+    }
+    return;
+  }
+
   // ---- Theme ----
   if (action === 'set-theme') {
     setThemeChoice(actionEl.dataset.themeChoice);
@@ -4542,6 +4875,12 @@ document.addEventListener('input', async (e) => {
 // render re-applies it, so without this the user's pick would be wiped by the
 // next live-sync re-render.
 document.addEventListener('change', async (e) => {
+  if (e.target.id === 'tabsBackupFile') {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    await prepareTabsRestore(file);
+    return;
+  }
   if (e.target.id === 'collectTargetSelect') {
     collectTargetId = String(e.target.value || '');
     return;
@@ -4559,6 +4898,12 @@ document.addEventListener('change', async (e) => {
   }
 
 });
+
+document.addEventListener('cancel', (e) => {
+  if (e.target.id !== 'tabsRestoreDialog') return;
+  if (tabsRestoreRunning) e.preventDefault();
+  else pendingTabsRestore = null;
+}, true);
 
 // async, and it awaits the commit: the commit writes to storage and re-renders,
 // and returning its promise is what lets a caller (or a test) know when that

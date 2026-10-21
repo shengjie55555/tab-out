@@ -1889,7 +1889,188 @@ async function testCollectionCardSharing() {
   eq('missing clipboard is handled', app.els.toastText.textContent, 'The clipboard is not available here');
 }
 
+async function testTabsBackup() {
+  section('Tabs — portable backup and restore');
+  const app = await boot();
+  const M = app.sandbox;
+  const snapshot = M.buildTabsBackup([
+    { id: 10, type: 'normal', focused: true, tabs: [
+      { index: 2, url: 'https://example.com/two', title: 'Two', groupId: 77 },
+      { index: 0, url: 'https://example.com/pin', title: 'Pin', pinned: true, groupId: -1 },
+      { index: 1, url: 'https://example.com/one', title: 'One', active: true, groupId: 77 },
+      { index: 3, url: 'chrome-extension://abc/index.html', title: 'Tab Out', groupId: -1 },
+    ] },
+    { id: 20, type: 'normal', tabs: [{ index: 0, url: 'https://other.example', groupId: 88 }] },
+    { id: 30, type: 'normal', incognito: true, tabs: [{ url: 'https://private.example' }] },
+    { id: 40, type: 'popup', tabs: [{ url: 'https://popup.example' }] },
+  ], [
+    { id: 77, windowId: 10, title: '<Team>', color: 'blue', collapsed: true },
+    { id: 88, windowId: 20, title: '', color: 'red', collapsed: false },
+  ], 'abc', '2026-10-21T00:00:00Z');
+  eq('only normal non-incognito windows are exported', snapshot.windows.length, 2);
+  eq('tab order and portable new-tab URL survive', snapshot.windows[0].tabs.map(t => t.url),
+    ['https://example.com/pin', 'https://example.com/one', 'https://example.com/two', 'chrome://newtab/']);
+  eq('group metadata survives', snapshot.windows[0].groups[0], { title: '<Team>', color: 'blue', collapsed: true });
+  eq('group membership uses portable indexes', snapshot.windows[0].tabs.map(t => t.group), [null, 0, 0, null]);
+  const roundTrip = JSON.parse(JSON.stringify(snapshot));
+  eq('JSON round trip retains the snapshot', M.validateTabsBackup(roundTrip), snapshot);
+  for (const mutate of [
+    x => { x.version = 2; },
+    x => { x.windows[0].tabs[0].url = 'javascript:alert(1)'; },
+    x => { x.windows[0].tabs[0].url = 'data:text/html,hello'; },
+    x => { x.windows[0].tabs[1].group = 999; },
+    x => { x.windows[0].groups[0].color = 'fake'; },
+    x => { x.windows[0].tabs[1].pinned = true; },
+    x => { x.windows[0].tabs[2].group = null; x.windows[0].tabs[3].group = 0; },
+    x => { x.windows[0].tabs[3].pinned = true; },
+  ]) {
+    const bad = JSON.parse(JSON.stringify(snapshot)); mutate(bad);
+    let rejected = false;
+    try { M.validateTabsBackup(bad); } catch { rejected = true; }
+    ok('malformed or unsafe import is rejected', rejected);
+  }
+  const opened = [], grouped = [], removed = [], updates = [];
+  let nextTab = 2000, nextWindow = 100;
+  M.chrome.windows.create = async opts => {
+    const id = nextWindow++;
+    return { id, tabs: [{ id: id * 10 }] };
+  };
+  M.chrome.tabs.create = async opts => { const id = nextTab++; opened.push({ id, ...opts }); return { id }; };
+  M.chrome.tabs.group = async opts => { grouped.push(opts); return 500 + grouped.length; };
+  M.chrome.tabGroups.update = async (id, opts) => updates.push({ id, ...opts });
+  M.chrome.tabs.remove = async ids => removed.push(ids);
+  const before = app.storage();
+  const result = await M.restoreTabsBackup(roundTrip);
+  eq('restore opens all windows and tabs', [result.windows, result.tabs, result.groups], [2, 5, 2]);
+  eq('pinned tabs restore with their pinned state', opened[0].pinned, true);
+  eq('groups target new tab IDs in their new window', grouped[0], { tabIds: [2001, 2002], createProperties: { windowId: 100 } });
+  eq('name, colour and collapse state restored', updates[0], { id: 501, title: '<Team>', color: 'blue', collapsed: true });
+  eq('only temporary tabs in new windows are removed', removed, [[1000], [1010]]);
+  eq('saved tabs and notes remain untouched', app.storage(), before);
+  opened.length = 0;
+  const invalid = JSON.parse(JSON.stringify(snapshot)); invalid.windows[1].tabs[0].url = 'javascript:alert(1)';
+  try { await M.restoreTabsBackup(invalid); } catch {}
+  eq('invalid later window stops restore before any tab opens', opened.length, 0);
+  M.chrome.tabs.create = async opts => {
+    if (opts.url.endsWith('/one')) throw new Error('cannot open');
+    return { id: nextTab++ };
+  };
+  const partial = await M.restoreTabsBackup(snapshot);
+  eq('one tab failure does not prevent other windows restoring', [partial.tabs, partial.failedTabs, partial.groups], [4, 1, 2]);
+  M.chrome.tabGroups.update = async () => { throw new Error('cannot update'); };
+  const groupFailure = await M.restoreTabsBackup(snapshot);
+  eq('group failures are reported without losing restored tabs', [groupFailure.tabs, groupFailure.failedGroups], [4, 2]);
+  M.chrome.windows.create = async () => { throw new Error('cannot create'); };
+  const failedWindows = await M.restoreTabsBackup(snapshot);
+  eq('window failure is reported for every affected tab and group',
+    [failedWindows.windows, failedWindows.failedTabs, failedWindows.failedGroups], [0, 5, 2]);
+
+  let shown = 0, closed = 0;
+  app.els.tabsRestoreDialog = makeEl('tabsRestoreDialog');
+  app.els.tabsRestoreDialog.showModal = () => shown++;
+  app.els.tabsRestoreDialog.close = () => closed++;
+  const file = { size: 1000, text: async () => JSON.stringify(snapshot) };
+  await app.fireEvent('change', { target: { id: 'tabsBackupFile', files: [file], value: 'backup.json' } });
+  eq('file selection shows confirmation without restoring windows', shown, 1);
+  ok('confirmation includes the tab and group counts', app.els.tabsRestoreSummary.textContent.includes('5 tabs and 2 groups'));
+  await app.fire('cancel-tabs-restore');
+  eq('cancel closes the confirmation', closed, 1);
+  let windowCreates = 0;
+  M.chrome.windows.create = async () => { windowCreates++; throw new Error('blocked'); };
+  await app.fire('confirm-tabs-restore');
+  eq('cancel discards the pending restore', windowCreates, 0);
+  await M.prepareTabsRestore({ size: 10, text: async () => '{invalid' });
+  eq('bad JSON does not show confirmation', shown, 1);
+  await M.prepareTabsRestore(file);
+  await app.fire('confirm-tabs-restore');
+  eq('confirmation restores only after the explicit click', windowCreates, 2);
+  ok('failure counts remain visible in the dialog', app.els.tabsRestoreStatus.textContent.includes('5 tabs and 2 groups could not be restored'));
+
+  class BackupURL extends URL {}
+  let downloadedBlob, downloads = 0, queryOptions;
+  BackupURL.createObjectURL = blob => { downloadedBlob = blob; return 'blob:backup'; };
+  BackupURL.revokeObjectURL = () => {};
+  M.URL = BackupURL;
+  M.Blob = Blob;
+  const createElement = M.document.createElement;
+  M.document.createElement = tag => {
+    const el = createElement(tag);
+    if (tag === 'a') el.click = () => downloads++;
+    return el;
+  };
+  M.chrome.windows.getAll = async opts => {
+    queryOptions = opts;
+    return [{ id: 1, type: 'normal', tabs: [{ url: 'https://fresh.example', title: 'Fresh', index: 0, groupId: -1 }] }];
+  };
+  await app.fire('backup-all-tabs');
+  eq('backup queries current windows with live tabs', queryOptions, { populate: true, windowTypes: ['normal'] });
+  eq('backup initiates one file download', downloads, 1);
+  eq('downloaded JSON contains fresh live URLs', JSON.parse(await downloadedBlob.text()).openTabs.windows[0].tabs[0].url, 'https://fresh.example');
+  eq('download includes collections', JSON.parse(await downloadedBlob.text()).collections, M.sanitizeCollectionTree(app.storage().collections));
+  eq('download includes saved-for-later entries', JSON.parse(await downloadedBlob.text()).deferred, app.storage().deferred);
+  M.chrome.tabGroups.query = async () => { throw new Error('permission missing'); };
+  await app.fire('backup-all-tabs');
+  eq('failed group query never downloads an incomplete backup', downloads, 1);
+}
+
+async function testDashboardBackup() {
+  section('Dashboard — combined backup and additive restore');
+  const app = await boot();
+  const M = app.sandbox;
+  const current = M.sanitizeCollectionTree(app.storage().collections);
+  const imported = { version: 1, nodes: [{ id: current.nodes[0].id, type: 'group', name: 'Imported',
+    collapsed: true, span: 2, children: [
+      { id: 'image-note', type: 'note', name: 'Image note', text: '![image](data:image/png;base64,AAAA)', status: 'doing', addedAt: '2026-10-21' },
+      { id: 'nested', type: 'group', name: 'Nested', children: [
+        { id: 'link', type: 'link', name: '<A>', url: 'https://example.com', status: 'done' },
+      ] },
+    ] }] };
+  const saved = app.storage().deferred;
+  const deferred = [{ ...saved[0], title: 'Imported item' }];
+  const value = { format: 'tab-out-backup', version: 1,
+    openTabs: { format: 'tab-out-tabs', version: 1, windows: [] }, collections: imported, deferred };
+  const snapshot = M.validateDashboardBackup(value);
+  eq('image Markdown survives backup validation', snapshot.collections.nodes[0].children[0].text, imported.nodes[0].children[0].text);
+  const merged = M.mergeBackupCollections(current, snapshot.collections);
+  eq('existing collections remain intact', merged.nodes.slice(0, current.nodes.length), current.nodes);
+  ok('colliding imported group ID is remapped', merged.nodes[merged.nodes.length - 1].id !== imported.nodes[0].id);
+  eq('identical remapped imports are not added twice', M.mergeBackupCollections(merged, snapshot.collections), merged);
+  const mergedDeferred = M.mergeBackupDeferred(saved, deferred);
+  eq('saved-for-later entries are appended', mergedDeferred.length, saved.length + 1);
+  ok('saved-for-later ID collision is remapped', mergedDeferred[mergedDeferred.length - 1].id !== deferred[0].id);
+  eq('reimporting saved items skips identical content', M.mergeBackupDeferred(mergedDeferred, deferred), mergedDeferred);
+  await M.restoreDashboardLibrary(snapshot);
+  eq('library restore persists merged collections', app.storage().collections, merged);
+  eq('library restore persists merged saved items', app.storage().deferred, mergedDeferred);
+  eq('library restore never creates or closes browser tabs', [app.calls.created.length, app.calls.remove.length], [0, 0]);
+  const legacy = M.validateDashboardBackup({ format: 'tab-out-tabs', version: 1, windows: [] });
+  eq('old tab-only backups do not invent library data', [legacy.collections, legacy.deferred], [null, null]);
+  const libraryOnly = M.validateDashboardBackup({ format: 'tab-out-library', version: 1, collections: imported, deferred });
+  eq('previous cross-browser library export is supported', libraryOnly.openTabs, null);
+  for (const mutate of [
+    x => { x.version = 99; },
+    x => { x.collections.version = 99; },
+    x => { x.collections.nodes[0].children.push({ id: 'image-note', type: 'note', name: 'Duplicate', text: 'x' }); },
+    x => { x.collections.nodes[0].children[0].text = null; },
+    x => { x.deferred = [null]; },
+  ]) {
+    const bad = JSON.parse(JSON.stringify(value)); mutate(bad);
+    let rejected = false; try { M.validateDashboardBackup(bad); } catch { rejected = true; }
+    ok('invalid combined backup is rejected before writes', rejected);
+  }
+  app.els.tabsRestoreDialog = makeEl('tabsRestoreDialog');
+  app.els.tabsRestoreDialog.showModal = () => {};
+  await M.prepareTabsRestore({ size: 1000, text: async () => JSON.stringify(value) });
+  eq('empty open tabs disable that restore option', [app.els.restoreOpenTabs.disabled, app.els.restoreOpenTabs.checked], [true, false]);
+  eq('library restore option is selected', app.els.restoreLibrary.checked, true);
+  await app.fire('confirm-tabs-restore');
+  ok('library-only restore reports success', app.els.tabsRestoreStatus.textContent.includes('Collected tabs and saved-for-later items restored'));
+  eq('repeated library restore is idempotent', app.storage().collections, merged);
+}
+
 const SUITES = [
+  ['dashboard backup',          testDashboardBackup],
+  ['tabs backup and restore',   testTabsBackup],
   ['collection card sharing',   testCollectionCardSharing],
   ['harness',                   testHarnessStore],
   ['collection model',          testCollectionModel],

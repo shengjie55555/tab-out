@@ -32,6 +32,7 @@ The agent will walk you through it. Takes about 1 minute.
 - **Close tabs with style** — swoosh sound + confetti burst
 - **Duplicate detection** flags the same page open twice, with one-click cleanup
 - **Batch closes ask first** — closing a whole group, the duplicates or everything takes two clicks. Closing one tab stays one click
+- **Backup and restore everything** — use **Backup all** in the page header to download one JSON file containing open tabs and groups, the collected library (including Markdown notes and embedded images), and saved-for-later entries and their archive. **Restore backup** lets you select open tabs, the library, or both. Tabs open in new windows; library entries are added, exact duplicates are skipped and conflicting IDs are remapped, so existing content stays available. Old tab-only backups and library exports are supported. Backups cover normal non-incognito windows and preserve tab order, pinning, active tabs, and group names, colours and collapse state. They do not contain browser bookmarks, history or login sessions. Keep the downloaded file somewhere safe; pages may require sign-in when restored.
 - **Collect a whole group** — file an entire Chrome group into your library as a subtree, leaving the tabs open
 - **Save for later** — bookmark individual tabs to a checklist before closing them. Tick items off as you read them, and the archive below keeps the lot: searchable, put back on the checklist, or deleted for good
 - **Localhost ports** shown next to localhost tabs, so you can tell your projects apart
